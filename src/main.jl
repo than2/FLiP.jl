@@ -227,6 +227,39 @@ function _stage_report(cfg::FLiPConfig, tree_res, qsm_res, config_path::Abstract
 end
 
 """
+    _summarize(cfg, pp_output, g_output, t_output, q_output, r_output) -> NamedTuple
+
+Build the stage-grouped summary returned by `run_pipeline`. Each stage's
+paths, written-flags, and counts live in their own sub-NamedTuple
+(`preprocess`, `ground`, `agh`, `tree`); the raw `qsm` and `report` stage
+outputs are forwarded as-is.
+"""
+function _summarize(cfg::FLiPConfig, pp_output, g_output, t_output, q_output, r_output)
+    return (
+        config = (
+            input_path    = cfg.pipeline_input_path,
+            output_dir    = cfg.pipeline_output_dir,
+            output_prefix = cfg.pipeline_output_prefix,
+        ),
+        preprocess = (path=pp_output.path,
+                      written=pp_output.written,
+                      n_points=g_output.n_preprocess),
+        ground     = (path=g_output.ground_path,
+                      written=g_output.ground_written,
+                      n_points=g_output.n_ground),
+        agh        = (path=g_output.agh_path,
+                      written=g_output.agh_written),
+        tree       = (path=t_output.tree_path,
+                      skeleton_path=t_output.skeleton_path,
+                      written=t_output.tree_written,
+                      skeleton_written=t_output.skeleton_written,
+                      n_components=t_output.n_components),
+        qsm        = q_output,
+        report     = r_output,
+    )
+end
+
+"""
     run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
 
 Run FLiP main pipeline stages in order:
@@ -239,74 +272,25 @@ Run FLiP main pipeline stages in order:
 """
 function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     cfg = _stage_initialization(config_path)
-    input_path    = cfg.pipeline_input_path
-    output_dir    = cfg.pipeline_output_dir
-    output_prefix = cfg.pipeline_output_prefix
-    output_fmt    = lowercase(cfg.pipeline_output_format)
 
-    # 1) preprocess
     pp_output = _stage_preprocess(cfg)
 
-    # 2) ground segmentation
     g_output  = _stage_ground(cfg, pp_output.cloud)
-    pp_output = (cloud=nothing, path=pp_output.path, written=pp_output.written)  # release preprocess cloud
+    pp_output = (cloud=nothing, path=pp_output.path, written=pp_output.written)
 
-    # 3) tree segmentation
-    t_output = _stage_tree(cfg, g_output.agh)
-    g_output = (ground=nothing, agh=nothing,
-                ground_path=g_output.ground_path, agh_path=g_output.agh_path,
-                ground_written=g_output.ground_written, agh_written=g_output.agh_written,
-                n_preprocess=g_output.n_preprocess, n_ground=g_output.n_ground)  # release ground clouds
+    t_output  = _stage_tree(cfg, g_output.agh)
+    g_output  = (ground=nothing, agh=nothing,
+                 ground_path=g_output.ground_path, agh_path=g_output.agh_path,
+                 ground_written=g_output.ground_written, agh_written=g_output.agh_written,
+                 n_preprocess=g_output.n_preprocess, n_ground=g_output.n_ground)
 
-    # 4) qsm
-    q_output = _stage_qsm(cfg, t_output.result, config_path)
-
-    # 5) report
-    r_output = _stage_report(cfg, t_output.result, q_output, config_path)
-
-    # Release heavy data before returning lightweight summary
-    t_output = (result=nothing,
-                tree_path=t_output.tree_path, skeleton_path=t_output.skeleton_path,
-                tree_written=t_output.tree_written, skeleton_written=t_output.skeleton_written,
-                n_components=t_output.n_components)
+    q_output  = _stage_qsm(cfg, t_output.result, config_path)
+    r_output  = _stage_report(cfg, t_output.result, q_output, config_path)
+    t_output  = (result=nothing,
+                 tree_path=t_output.tree_path, skeleton_path=t_output.skeleton_path,
+                 tree_written=t_output.tree_written, skeleton_written=t_output.skeleton_written,
+                 n_components=t_output.n_components)
     GC.gc()
 
-    # Locals retained by the (still-flat) summary builder
-    preprocess_path       = pp_output.path
-    preprocess_written    = pp_output.written
-    ground_path           = g_output.ground_path
-    agh_path              = g_output.agh_path
-    ground_written        = g_output.ground_written
-    agh_written           = g_output.agh_written
-    n_preprocess          = g_output.n_preprocess
-    n_ground              = g_output.n_ground
-    tree_path             = t_output.tree_path
-    tree_skeleton_path    = t_output.skeleton_path
-    tree_written          = t_output.tree_written
-    tree_skeleton_written = t_output.skeleton_written
-    tree_components       = t_output.n_components
-    qsm_res    = q_output
-    report_res = r_output
-
-    return (
-        input_path=input_path,
-        output_dir=output_dir,
-        output_prefix=output_prefix,
-        n_preprocess_input=n_preprocess,
-        n_preprocess=n_preprocess,
-        n_ground=n_ground,
-        tree_components=tree_components,
-        preprocess_path=preprocess_path,
-        ground_path=ground_path,
-        agh_path=agh_path,
-        tree_path=tree_path,
-        skeleton_path=tree_skeleton_path,
-        preprocess_written=preprocess_written,
-        ground_written=ground_written,
-        agh_written=agh_written,
-        tree_written=tree_written,
-        tree_skeleton_written=tree_skeleton_written,
-        qsm_result=qsm_res,
-        report_result=report_res,
-    )
+    return _summarize(cfg, pp_output, g_output, t_output, q_output, r_output)
 end

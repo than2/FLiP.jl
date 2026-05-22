@@ -59,21 +59,21 @@ enable_statistical_filter = false
 
         result = run_pipeline(config_path)
 
-        @test result.preprocess_written
-        @test result.ground_written
-        @test result.agh_written
-        @test result.tree_written == false
-        @test result.tree_skeleton_written == false
-        @test result.qsm_result.status == :skipped
-        @test result.report_result.status == :skipped
+        @test result.preprocess.written
+        @test result.ground.written
+        @test result.agh.written
+        @test result.tree.written == false
+        @test result.tree.skeleton_written == false
+        @test result.qsm.status == :skipped
+        @test result.report.status == :skipped
 
-        @test basename(result.preprocess_path) == "test_preprocess.las"
-        @test basename(result.ground_path) == "test_ground.las"
-        @test basename(result.agh_path) == "test_agh.las"
+        @test basename(result.preprocess.path) == "test_preprocess.las"
+        @test basename(result.ground.path) == "test_ground.las"
+        @test basename(result.agh.path) == "test_agh.las"
 
-        @test isfile(result.preprocess_path)
-        @test isfile(result.ground_path)
-        @test isfile(result.agh_path)
+        @test isfile(result.preprocess.path)
+        @test isfile(result.ground.path)
+        @test isfile(result.agh.path)
     finally
         rm(test_dir; recursive=true, force=true)
     end
