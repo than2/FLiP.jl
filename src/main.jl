@@ -1,64 +1,28 @@
 """
-    _prepare_stage_input(data, cfg, stem, label, consumer) -> PointCloud
+    run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
 
-Materialize a stage's PointCloud input. If `data` is non-nothing, return it
-unchanged. Otherwise, try the single-file output `{prefix}{stem}.{fmt}` on
-disk; if that's missing, try the multi-file `{prefix}{stem}_S{i}.{fmt}`
-pattern and merge. Throws if no source is available.
+Run FLiP main pipeline stages in order:
+1. load config
+2. preprocess
+3. ground_segmentation
+4. tree_segmentation
+5. qsm
+6. generate_report
 """
-function _prepare_stage_input(data, cfg::FLiPConfig, stem::AbstractString,
-                              label::AbstractString, consumer::AbstractString)
-    isnothing(data) || return data
+function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
+    cfg = _stage_initialization(config_path)
 
-    fmt = lowercase(cfg.pipeline_output_format)
-    single = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, stem, fmt)
-    if isfile(single)
-        @info "[main] resume: loading $single"
-        return read_pc(single)
-    end
+    pp_output = _stage_preprocess(cfg)
+    g_output  = _stage_ground(cfg, pp_output.cloud);    pp_output = _drop_preprocess_clouds(pp_output)
+    t_output  = _stage_tree(cfg, g_output.agh);         g_output  = _drop_ground_clouds(g_output)
+    q_output  = _stage_qsm(cfg, t_output.result, config_path)
+    r_output  = _stage_report(cfg, t_output.result, q_output, config_path)
+    t_output  = _drop_tree_clouds(t_output); GC.gc()
 
-    scans = find_scan_outputs(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, stem, fmt)
-    if !isempty(scans)
-        @info "[main] resume: loading $(length(scans)) $stem files from $(cfg.pipeline_output_dir)"
-        all_coords = Vector{Matrix{<:AbstractFloat}}(undef, length(scans))
-        all_attrs  = Vector{Dict{Symbol,Vector}}(undef, length(scans))
-        for (i, fpath) in enumerate(scans)
-            @info "[main] resume: loading $fpath"
-            pc = read_pc(fpath)
-            all_coords[i] = coordinates(pc)
-            all_attrs[i]  = _all_attributes(pc)
-        end
-        merged = merge_pointclouds(all_coords, all_attrs)
-        length(scans) > 1 && @info "[main] resume: merged $(length(scans)) scans → $(npoints(merged)) points"
-        return merged
-    end
-
-    throw(ArgumentError(
-        "$consumer requires $label in memory, at $single, or as $(cfg.pipeline_output_prefix)$(stem)_S{i}.$fmt scans; no data available"))
+    return _summarize(cfg, pp_output, g_output, t_output, q_output, r_output)
 end
 
-"""
-    _load_tree_result(cfg) -> NamedTuple
-
-Reconstruct a tree-segmentation result NamedTuple from disk (used by stages
-4 and 5 when stage 3 was disabled or skipped). Loads the tree output and the
-optional skeleton; fills `filtered_cloud`, `n_components`, `neighbor_radius`
-with empty / zero defaults. Throws if the tree output is not on disk.
-"""
-function _load_tree_result(cfg::FLiPConfig)
-    pc_tree = _prepare_stage_input(nothing, cfg, "tree",
-                                   "tree output", "qsm/report stage")
-    fmt = lowercase(cfg.pipeline_output_format)
-    skeleton_path = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "skeleton", fmt)
-    pc_skeleton = isfile(skeleton_path) ? read_pc(skeleton_path) : pc_tree[1:0]
-    return (
-        pc_output=pc_tree,
-        skeleton_cloud=pc_skeleton,
-        filtered_cloud=pc_tree[1:0],
-        n_components=0,
-        neighbor_radius=0.0,
-    )
-end
+# ── Stage functions ────────────────────────────────────────────────
 
 """
     _stage_initialization(config_path::AbstractString) -> FLiPConfig
@@ -226,10 +190,75 @@ function _stage_report(cfg::FLiPConfig, tree_res, qsm_res, config_path::Abstract
                            output_prefix=cfg.pipeline_output_prefix)
 end
 
-# ── Stage-output cloud release helpers ─────────────────────────────
-# Each returns the same NamedTuple shape with heavy point-cloud fields nulled,
-# so the GC can reclaim memory while paths and written flags are kept for the
-# summary.
+# ── Resume helpers (used by the stage functions) ──────────────────
+
+"""
+    _prepare_stage_input(data, cfg, stem, label, consumer) -> PointCloud
+
+Materialize a stage's PointCloud input. If `data` is non-nothing, return it
+unchanged. Otherwise, try the single-file output `{prefix}{stem}.{fmt}` on
+disk; if that's missing, try the multi-file `{prefix}{stem}_S{i}.{fmt}`
+pattern and merge. Throws if no source is available.
+"""
+function _prepare_stage_input(data, cfg::FLiPConfig, stem::AbstractString,
+                              label::AbstractString, consumer::AbstractString)
+    isnothing(data) || return data
+
+    fmt = lowercase(cfg.pipeline_output_format)
+    single = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, stem, fmt)
+    if isfile(single)
+        @info "[main] resume: loading $single"
+        return read_pc(single)
+    end
+
+    scans = find_scan_outputs(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, stem, fmt)
+    if !isempty(scans)
+        @info "[main] resume: loading $(length(scans)) $stem files from $(cfg.pipeline_output_dir)"
+        all_coords = Vector{Matrix{<:AbstractFloat}}(undef, length(scans))
+        all_attrs  = Vector{Dict{Symbol,Vector}}(undef, length(scans))
+        for (i, fpath) in enumerate(scans)
+            @info "[main] resume: loading $fpath"
+            pc = read_pc(fpath)
+            all_coords[i] = coordinates(pc)
+            all_attrs[i]  = _all_attributes(pc)
+        end
+        merged = merge_pointclouds(all_coords, all_attrs)
+        length(scans) > 1 && @info "[main] resume: merged $(length(scans)) scans → $(npoints(merged)) points"
+        return merged
+    end
+
+    throw(ArgumentError(
+        "$consumer requires $label in memory, at $single, or as $(cfg.pipeline_output_prefix)$(stem)_S{i}.$fmt scans; no data available"))
+end
+
+"""
+    _load_tree_result(cfg) -> NamedTuple
+
+Reconstruct a tree-segmentation result NamedTuple from disk (used by stages
+4 and 5 when stage 3 was disabled or skipped). Loads the tree output and the
+optional skeleton; fills `filtered_cloud`, `n_components`, `neighbor_radius`
+with empty / zero defaults. Throws if the tree output is not on disk.
+"""
+function _load_tree_result(cfg::FLiPConfig)
+    pc_tree = _prepare_stage_input(nothing, cfg, "tree",
+                                   "tree output", "qsm/report stage")
+    fmt = lowercase(cfg.pipeline_output_format)
+    skeleton_path = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "skeleton", fmt)
+    pc_skeleton = isfile(skeleton_path) ? read_pc(skeleton_path) : pc_tree[1:0]
+    return (
+        pc_output=pc_tree,
+        skeleton_cloud=pc_skeleton,
+        filtered_cloud=pc_tree[1:0],
+        n_components=0,
+        neighbor_radius=0.0,
+    )
+end
+
+# ── Memory release + summary (used by run_pipeline) ───────────────
+
+# Each _drop_*_clouds returns the same NamedTuple shape with heavy
+# point-cloud fields nulled, so the GC can reclaim memory while paths and
+# written flags are kept for the summary.
 _drop_preprocess_clouds(pp) = (cloud=nothing, path=pp.path, written=pp.written)
 _drop_ground_clouds(g) = (ground=nothing, agh=nothing,
                           ground_path=g.ground_path, agh_path=g.agh_path,
@@ -271,28 +300,4 @@ function _summarize(cfg::FLiPConfig, pp_output, g_output, t_output, q_output, r_
         qsm        = q_output,
         report     = r_output,
     )
-end
-
-"""
-    run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
-
-Run FLiP main pipeline stages in order:
-1. load config
-2. preprocess
-3. ground_segmentation
-4. tree_segmentation
-5. qsm
-6. generate_report
-"""
-function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
-    cfg = _stage_initialization(config_path)
-
-    pp_output = _stage_preprocess(cfg)
-    g_output  = _stage_ground(cfg, pp_output.cloud);    pp_output = _drop_preprocess_clouds(pp_output)
-    t_output  = _stage_tree(cfg, g_output.agh);         g_output  = _drop_ground_clouds(g_output)
-    q_output  = _stage_qsm(cfg, t_output.result, config_path)
-    r_output  = _stage_report(cfg, t_output.result, q_output, config_path)
-    t_output  = _drop_tree_clouds(t_output); GC.gc()
-
-    return _summarize(cfg, pp_output, g_output, t_output, q_output, r_output)
 end
