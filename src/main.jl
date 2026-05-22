@@ -92,6 +92,67 @@ function _stage_initialization(config_path::AbstractString)
 end
 
 """
+    _stage_preprocess(cfg) -> (cloud, path, written)
+
+Run the preprocess stage (or skip it if disabled). The output cloud and the
+per-scan `_S{i}` files are written to disk by `preprocess(; cfg)` itself.
+
+Returns a NamedTuple `(cloud::Union{Nothing,PointCloud}, path::String,
+written::Bool)`: the merged cloud (or `nothing` if disabled), the canonical
+single-file output path, and whether the stage produced output.
+"""
+function _stage_preprocess(cfg::FLiPConfig)
+    fmt  = lowercase(cfg.pipeline_output_format)
+    path = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "preprocess", fmt)
+    if cfg.pipeline_enable_preprocess
+        return (cloud=preprocess(; cfg=cfg), path=path, written=true)
+    end
+    println("[main] preprocess disabled by config")
+    return (cloud=nothing, path=path, written=false)
+end
+
+"""
+    _stage_ground(cfg, pc_preprocess) -> NamedTuple
+
+Run ground segmentation, write the ground and optional AGH outputs, and
+return the resulting clouds plus path / written-flag / point-count metadata.
+If `pc_preprocess` is `nothing`, the input is loaded from disk via
+`_prepare_stage_input`.
+
+Returns `(ground, agh, ground_path, agh_path, ground_written, agh_written,
+n_preprocess, n_ground)`.
+"""
+function _stage_ground(cfg::FLiPConfig, pc_preprocess)
+    fmt = lowercase(cfg.pipeline_output_format)
+    ground_path = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "ground", fmt)
+    agh_path    = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "agh",    fmt)
+
+    if !cfg.pipeline_enable_ground_segmentation
+        println("[main] ground segmentation disabled by config")
+        return (ground=nothing, agh=nothing,
+                ground_path=ground_path, agh_path=agh_path,
+                ground_written=false, agh_written=false,
+                n_preprocess=0, n_ground=0)
+    end
+
+    ground_input = _prepare_stage_input(pc_preprocess, cfg, "preprocess",
+                                        "preprocess output", "ground segmentation")
+    res = ground_segmentation(ground_input; cfg=cfg)
+
+    write_pc(ground_path, res.ground_points); println("[main] wrote: $ground_path")
+    agh_written = false
+    if cfg.pipeline_enable_agh
+        write_pc(agh_path, res.agh_cloud); println("[main] wrote: $agh_path")
+        agh_written = true
+    end
+
+    return (ground=res.ground_points, agh=res.agh_cloud,
+            ground_path=ground_path, agh_path=agh_path,
+            ground_written=true, agh_written=agh_written,
+            n_preprocess=npoints(res.agh_cloud), n_ground=npoints(res.ground_points))
+end
+
+"""
     run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
 
 Run FLiP main pipeline stages in order:
@@ -109,46 +170,23 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     output_prefix = cfg.pipeline_output_prefix
     output_fmt    = lowercase(cfg.pipeline_output_format)
 
-    # 1) preprocess (reads input files, preprocesses each, writes individual outputs)
-    preprocess_path = get_output_path(output_dir, output_prefix, "preprocess", output_fmt)
-    preprocess_written = false
-    pc_preprocess = nothing
-    if cfg.pipeline_enable_preprocess
-        pc_preprocess = preprocess(; cfg=cfg)
-        preprocess_written = true
-    else
-        println("[main] preprocess disabled by config")
-    end
+    # 1) preprocess
+    pp = _stage_preprocess(cfg)
 
     # 2) ground segmentation
-    ground_points = nothing
-    pc_agh = nothing
-    ground_path = get_output_path(output_dir, output_prefix, "ground", output_fmt)
-    agh_path = get_output_path(output_dir, output_prefix, "agh", output_fmt)
-    ground_written = false
-    agh_written = false
+    g = _stage_ground(cfg, pp.cloud)
+    pp = (cloud=nothing, path=pp.path, written=pp.written)  # release preprocess cloud
+    pc_agh = g.agh
 
-    n_preprocess = 0
-    n_ground = 0
-
-    if cfg.pipeline_enable_ground_segmentation
-        ground_input = _prepare_stage_input(pc_preprocess, cfg, "preprocess", "preprocess output", "ground segmentation")
-        pc_preprocess = nothing  # release input — no longer needed
-        ground_res = ground_segmentation(ground_input; cfg=cfg)
-        ground_input = nothing
-        ground_points = ground_res.ground_points
-        pc_agh = ground_res.agh_cloud
-        n_preprocess = npoints(ground_res.agh_cloud)
-        n_ground = npoints(ground_points)
-        write_pc(ground_path, ground_points); println("[main] wrote: $ground_path"); ground_written = true
-        ground_points = nothing  # written to disk, release
-        if cfg.pipeline_enable_agh
-            write_pc(agh_path, pc_agh); println("[main] wrote: $agh_path"); agh_written = true
-        end
-    else
-        println("[main] ground segmentation disabled by config")
-        pc_preprocess = nothing  # no downstream consumer, release
-    end
+    # Locals retained for use by downstream stages and the summary builder
+    preprocess_path    = pp.path
+    preprocess_written = pp.written
+    ground_path        = g.ground_path
+    agh_path           = g.agh_path
+    ground_written     = g.ground_written
+    agh_written        = g.agh_written
+    n_preprocess       = g.n_preprocess
+    n_ground           = g.n_ground
 
     # 3) tree segmentation
     tree_path = get_output_path(output_dir, output_prefix, "tree", output_fmt)
