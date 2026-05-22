@@ -226,6 +226,20 @@ function _stage_report(cfg::FLiPConfig, tree_res, qsm_res, config_path::Abstract
                            output_prefix=cfg.pipeline_output_prefix)
 end
 
+# ── Stage-output cloud release helpers ─────────────────────────────
+# Each returns the same NamedTuple shape with heavy point-cloud fields nulled,
+# so the GC can reclaim memory while paths and written flags are kept for the
+# summary.
+_drop_preprocess_clouds(pp) = (cloud=nothing, path=pp.path, written=pp.written)
+_drop_ground_clouds(g) = (ground=nothing, agh=nothing,
+                          ground_path=g.ground_path, agh_path=g.agh_path,
+                          ground_written=g.ground_written, agh_written=g.agh_written,
+                          n_preprocess=g.n_preprocess, n_ground=g.n_ground)
+_drop_tree_clouds(t) = (result=nothing,
+                        tree_path=t.tree_path, skeleton_path=t.skeleton_path,
+                        tree_written=t.tree_written, skeleton_written=t.skeleton_written,
+                        n_components=t.n_components)
+
 """
     _summarize(cfg, pp_output, g_output, t_output, q_output, r_output) -> NamedTuple
 
@@ -274,23 +288,11 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     cfg = _stage_initialization(config_path)
 
     pp_output = _stage_preprocess(cfg)
-
-    g_output  = _stage_ground(cfg, pp_output.cloud)
-    pp_output = (cloud=nothing, path=pp_output.path, written=pp_output.written)
-
-    t_output  = _stage_tree(cfg, g_output.agh)
-    g_output  = (ground=nothing, agh=nothing,
-                 ground_path=g_output.ground_path, agh_path=g_output.agh_path,
-                 ground_written=g_output.ground_written, agh_written=g_output.agh_written,
-                 n_preprocess=g_output.n_preprocess, n_ground=g_output.n_ground)
-
+    g_output  = _stage_ground(cfg, pp_output.cloud);    pp_output = _drop_preprocess_clouds(pp_output)
+    t_output  = _stage_tree(cfg, g_output.agh);         g_output  = _drop_ground_clouds(g_output)
     q_output  = _stage_qsm(cfg, t_output.result, config_path)
     r_output  = _stage_report(cfg, t_output.result, q_output, config_path)
-    t_output  = (result=nothing,
-                 tree_path=t_output.tree_path, skeleton_path=t_output.skeleton_path,
-                 tree_written=t_output.tree_written, skeleton_written=t_output.skeleton_written,
-                 n_components=t_output.n_components)
-    GC.gc()
+    t_output  = _drop_tree_clouds(t_output); GC.gc()
 
     return _summarize(cfg, pp_output, g_output, t_output, q_output, r_output)
 end
