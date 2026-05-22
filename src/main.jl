@@ -56,6 +56,37 @@ end
 end
 
 """
+    _stage_initialization(config_path::AbstractString) -> FLiPConfig
+
+Load the TOML config, normalize paths (expand `~/`, strip whitespace),
+validate required pipeline fields, and create the output directory. Mutates
+`cfg` so downstream code sees the resolved values. Returns the prepared
+`FLiPConfig` (also mutates the global `_CFG` via `load_config!`).
+"""
+function _stage_initialization(config_path::AbstractString)
+    cfg = load_config!(String(config_path))
+
+    _expand_home(p) = startswith(strip(p), "~/") ? joinpath(homedir(), strip(p)[3:end]) : strip(p)
+    cfg.pipeline_input_path    = _expand_home(cfg.pipeline_input_path)
+    cfg.pipeline_output_dir    = _expand_home(cfg.pipeline_output_dir)
+    cfg.pipeline_output_prefix = strip(cfg.pipeline_output_prefix)
+
+    isempty(cfg.pipeline_input_path)    && throw(ArgumentError("pipeline.input_path must be set in config"))
+    isempty(cfg.pipeline_output_dir)    && throw(ArgumentError("pipeline.output_dir must be set in config"))
+    isempty(cfg.pipeline_output_prefix) && throw(ArgumentError("pipeline.output_prefix must be set in config"))
+    (isfile(cfg.pipeline_input_path) || isdir(cfg.pipeline_input_path)) ||
+        throw(ArgumentError("pipeline input path not found: $(cfg.pipeline_input_path)"))
+
+    cfg.pipeline_subsample_res > 0 || throw(ArgumentError("pipeline.subsample_res must be > 0"))
+    cfg.pipeline_xy_resolution > 0 || throw(ArgumentError("pipeline.xy_resolution must be > 0"))
+    cfg.pipeline_idw_k >= 1        || throw(ArgumentError("pipeline.idw_k must be >= 1"))
+    cfg.pipeline_idw_power > 0     || throw(ArgumentError("pipeline.idw_power must be > 0"))
+
+    mkpath(cfg.pipeline_output_dir)
+    return cfg
+end
+
+"""
     run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
 
 Run FLiP main pipeline stages in order:
@@ -67,29 +98,11 @@ Run FLiP main pipeline stages in order:
 6. generate_report
 """
 function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
-    cfg = load_config!(String(config_path))
-
-    _expand(p) = startswith(strip(p), "~/") ? joinpath(homedir(), strip(p)[3:end]) : strip(p)
-    input_path = _expand(cfg.pipeline_input_path)
-    output_dir = _expand(cfg.pipeline_output_dir)
-    output_prefix = strip(cfg.pipeline_output_prefix)
-
-    isempty(input_path) && throw(ArgumentError("pipeline.input_path must be set in config"))
-    isempty(output_dir) && throw(ArgumentError("pipeline.output_dir must be set in config"))
-    isempty(output_prefix) && throw(ArgumentError("pipeline.output_prefix must be set in config"))
-    (isfile(input_path) || isdir(input_path)) || throw(ArgumentError("pipeline input path not found: $input_path"))
-
-    cfg.pipeline_subsample_res > 0 || throw(ArgumentError("pipeline.subsample_res must be > 0"))
-    cfg.pipeline_xy_resolution > 0 || throw(ArgumentError("pipeline.xy_resolution must be > 0"))
-    cfg.pipeline_idw_k >= 1 || throw(ArgumentError("pipeline.idw_k must be >= 1"))
-    cfg.pipeline_idw_power > 0 || throw(ArgumentError("pipeline.idw_power must be > 0"))
-
-    output_fmt = lowercase(cfg.pipeline_output_format)
-    mkpath(output_dir)
-
-    # Update expanded paths back into config for preprocess
-    cfg.pipeline_input_path = input_path
-    cfg.pipeline_output_dir = output_dir
+    cfg = _stage_initialization(config_path)
+    input_path    = cfg.pipeline_input_path
+    output_dir    = cfg.pipeline_output_dir
+    output_prefix = cfg.pipeline_output_prefix
+    output_fmt    = lowercase(cfg.pipeline_output_format)
 
     # 1) preprocess (reads input files, preprocesses each, writes individual outputs)
     preprocess_path = get_output_path(output_dir, output_prefix, "preprocess", output_fmt)
