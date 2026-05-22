@@ -23,26 +23,6 @@ mutable struct PointCloud{T<:AbstractFloat}
     attrs::Dict{Symbol,Vector}
 end
 
-# ── Type mappings for LAS extra byte dimensions ───────────────────
-
-const _EXTRA_TYPE_TO_CODE = Dict{DataType,Int}(
-    UInt8 => 1, Int8 => 2, UInt16 => 3, Int16 => 4,
-    UInt32 => 5, Int32 => 6, UInt64 => 7, Int64 => 8,
-    Float32 => 9, Float64 => 10,
-)
-
-const _LAS_EXTRA_SCALAR_TYPES = Dict(
-    1 => UInt8, 2 => Int8, 3 => UInt16, 4 => Int16,
-    5 => UInt32, 6 => Int32, 7 => UInt64, 8 => Int64,
-    9 => Float32, 10 => Float64,
-)
-
-const _LAS_EXTRA_SCALAR_BYTES = Dict(
-    1 => 1, 2 => 1, 3 => 2, 4 => 2,
-    5 => 4, 6 => 4, 7 => 8, 8 => 8,
-    9 => 4, 10 => 8,
-)
-
 # ── Accessors ──────────────────────────────────────────────────────
 
 """Return the number of points in the cloud."""
