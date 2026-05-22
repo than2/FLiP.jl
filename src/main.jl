@@ -245,45 +245,48 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     output_fmt    = lowercase(cfg.pipeline_output_format)
 
     # 1) preprocess
-    pp = _stage_preprocess(cfg)
+    pp_output = _stage_preprocess(cfg)
 
     # 2) ground segmentation
-    g = _stage_ground(cfg, pp.cloud)
-    pp = (cloud=nothing, path=pp.path, written=pp.written)  # release preprocess cloud
-    pc_agh = g.agh
-
-    # Locals retained for use by downstream stages and the summary builder
-    preprocess_path    = pp.path
-    preprocess_written = pp.written
-    ground_path        = g.ground_path
-    agh_path           = g.agh_path
-    ground_written     = g.ground_written
-    agh_written        = g.agh_written
-    n_preprocess       = g.n_preprocess
-    n_ground           = g.n_ground
+    g_output  = _stage_ground(cfg, pp_output.cloud)
+    pp_output = (cloud=nothing, path=pp_output.path, written=pp_output.written)  # release preprocess cloud
 
     # 3) tree segmentation
-    t = _stage_tree(cfg, pc_agh)
-    pc_agh = nothing  # released — _stage_tree consumed it
+    t_output = _stage_tree(cfg, g_output.agh)
+    g_output = (ground=nothing, agh=nothing,
+                ground_path=g_output.ground_path, agh_path=g_output.agh_path,
+                ground_written=g_output.ground_written, agh_written=g_output.agh_written,
+                n_preprocess=g_output.n_preprocess, n_ground=g_output.n_ground)  # release ground clouds
 
     # 4) qsm
-    q = _stage_qsm(cfg, t.result, config_path)
+    q_output = _stage_qsm(cfg, t_output.result, config_path)
 
     # 5) report
-    r = _stage_report(cfg, t.result, q, config_path)
-
-    # Locals retained by the summary builder
-    tree_path             = t.tree_path
-    tree_skeleton_path    = t.skeleton_path
-    tree_written          = t.tree_written
-    tree_skeleton_written = t.skeleton_written
-    tree_components       = t.n_components
-    qsm_res    = q
-    report_res = r
+    r_output = _stage_report(cfg, t_output.result, q_output, config_path)
 
     # Release heavy data before returning lightweight summary
-    t = nothing
+    t_output = (result=nothing,
+                tree_path=t_output.tree_path, skeleton_path=t_output.skeleton_path,
+                tree_written=t_output.tree_written, skeleton_written=t_output.skeleton_written,
+                n_components=t_output.n_components)
     GC.gc()
+
+    # Locals retained by the (still-flat) summary builder
+    preprocess_path       = pp_output.path
+    preprocess_written    = pp_output.written
+    ground_path           = g_output.ground_path
+    agh_path              = g_output.agh_path
+    ground_written        = g_output.ground_written
+    agh_written           = g_output.agh_written
+    n_preprocess          = g_output.n_preprocess
+    n_ground              = g_output.n_ground
+    tree_path             = t_output.tree_path
+    tree_skeleton_path    = t_output.skeleton_path
+    tree_written          = t_output.tree_written
+    tree_skeleton_written = t_output.skeleton_written
+    tree_components       = t_output.n_components
+    qsm_res    = q_output
+    report_res = r_output
 
     return (
         input_path=input_path,
