@@ -13,23 +13,23 @@ function _prepare_stage_input(data, cfg::FLiPConfig, stem::AbstractString,
     fmt = lowercase(cfg.pipeline_output_format)
     single = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, stem, fmt)
     if isfile(single)
-        println("[main] resume: loading $single")
+        @info "[main] resume: loading $single"
         return read_pc(single)
     end
 
     scans = find_scan_outputs(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, stem, fmt)
     if !isempty(scans)
-        println("[main] resume: loading $(length(scans)) $stem files from $(cfg.pipeline_output_dir)")
+        @info "[main] resume: loading $(length(scans)) $stem files from $(cfg.pipeline_output_dir)"
         all_coords = Vector{Matrix{<:AbstractFloat}}(undef, length(scans))
         all_attrs  = Vector{Dict{Symbol,Vector}}(undef, length(scans))
         for (i, fpath) in enumerate(scans)
-            println("[main] resume: loading $fpath")
+            @info "[main] resume: loading $fpath"
             pc = read_pc(fpath)
             all_coords[i] = coordinates(pc)
             all_attrs[i]  = _all_attributes(pc)
         end
         merged = merge_pointclouds(all_coords, all_attrs)
-        length(scans) > 1 && println("[main] resume: merged $(length(scans)) scans → $(npoints(merged)) points")
+        length(scans) > 1 && @info "[main] resume: merged $(length(scans)) scans → $(npoints(merged)) points"
         return merged
     end
 
@@ -107,7 +107,7 @@ function _stage_preprocess(cfg::FLiPConfig)
     if cfg.pipeline_enable_preprocess
         return (cloud=preprocess(; cfg=cfg), path=path, written=true)
     end
-    println("[main] preprocess disabled by config")
+    @info "[main] preprocess disabled by config"
     return (cloud=nothing, path=path, written=false)
 end
 
@@ -128,7 +128,7 @@ function _stage_ground(cfg::FLiPConfig, pc_preprocess)
     agh_path    = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "agh",    fmt)
 
     if !cfg.pipeline_enable_ground_segmentation
-        println("[main] ground segmentation disabled by config")
+        @info "[main] ground segmentation disabled by config"
         return (ground=nothing, agh=nothing,
                 ground_path=ground_path, agh_path=agh_path,
                 ground_written=false, agh_written=false,
@@ -139,10 +139,10 @@ function _stage_ground(cfg::FLiPConfig, pc_preprocess)
                                         "preprocess output", "ground segmentation")
     res = ground_segmentation(ground_input; cfg=cfg)
 
-    write_pc(ground_path, res.ground_points); println("[main] wrote: $ground_path")
+    write_pc(ground_path, res.ground_points); @info "[main] wrote: $ground_path"
     agh_written = false
     if cfg.pipeline_enable_agh
-        write_pc(agh_path, res.agh_cloud); println("[main] wrote: $agh_path")
+        write_pc(agh_path, res.agh_cloud); @info "[main] wrote: $agh_path"
         agh_written = true
     end
 
@@ -169,7 +169,7 @@ function _stage_tree(cfg::FLiPConfig, pc_agh)
     skeleton_path = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "skeleton", fmt)
 
     if !cfg.pipeline_enable_tree_segmentation
-        println("[main] tree segmentation disabled by config")
+        @info "[main] tree segmentation disabled by config"
         return (result=nothing,
                 tree_path=tree_path, skeleton_path=skeleton_path,
                 tree_written=false, skeleton_written=false,
@@ -181,8 +181,8 @@ function _stage_tree(cfg::FLiPConfig, pc_agh)
     res = tree_segmentation(tree_input; cfg=cfg)
     tree_input = nothing  # release input
 
-    write_pc(tree_path,     res.pc_output);      println("[main] wrote: $tree_path")
-    write_pc(skeleton_path, res.skeleton_cloud); println("[main] wrote: $skeleton_path")
+    write_pc(tree_path,     res.pc_output);      @info "[main] wrote: $tree_path"
+    write_pc(skeleton_path, res.skeleton_cloud); @info "[main] wrote: $skeleton_path"
 
     return (result=res,
             tree_path=tree_path, skeleton_path=skeleton_path,
