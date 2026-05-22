@@ -46,7 +46,7 @@ using MultivariateStats
 using Rotations
 
 # Include submodules
-include("types.jl")
+include("pointcloud.jl")
 include("io.jl")
 include("config.jl")
 include("subsampling.jl")
