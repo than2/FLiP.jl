@@ -403,7 +403,7 @@ function create_skeleton_cloud(
     end
 
     if max_node == 0
-        empty_pc = PointCloudData(zeros(Float64, 0, 3), Dict{Symbol,Vector}())
+        empty_pc = PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}())
         return (skeleton_cloud=empty_pc, graph_skeleton=SimpleGraph{Int}(0))
     end
 
@@ -440,7 +440,7 @@ function create_skeleton_cloud(
     end
 
     # Build skeleton PointCloud
-    skel_pc = PointCloudData(skel_coords, Dict{Symbol,Vector}())
+    skel_pc = PointCloud(skel_coords, Dict{Symbol,Vector}())
     skel_pc = setattribute!(skel_pc, :node_id,  skel_nids)
     skel_pc = setattribute!(skel_pc,  :n_points, skel_npts)
 
@@ -990,7 +990,7 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     empty_result = (
         filtered_cloud=pc[1:0],
         pc_output=pc[1:0],
-        skeleton_cloud=PointCloudData(zeros(Float64, 0, 3), Dict{Symbol,Vector}()),
+        skeleton_cloud=PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}()),
         n_components=0,
         neighbor_radius=0.0,
     )
@@ -1092,7 +1092,7 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
 
     # ── Merge skeleton clouds ────────────────────────────────────────────
     if isempty(all_skel_coords)
-        merged_skel = PointCloudData(zeros(Float64, 0, 3), Dict{Symbol,Vector}())
+        merged_skel = PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}())
         merged_skel_graph = SimpleGraph{Int}(0)
     else
         merged_skel_coords = vcat(all_skel_coords...)
@@ -1106,7 +1106,7 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
         for k in common_keys
             merged_skel_attrs[k] = vcat([a[k] for a in all_skel_attrs]...)
         end
-        merged_skel = PointCloudData(merged_skel_coords, merged_skel_attrs)
+        merged_skel = PointCloud(merged_skel_coords, merged_skel_attrs)
 
         # Build merged skeleton graph
         merged_skel_graph = SimpleGraph{Int}(skel_vertex_offset)

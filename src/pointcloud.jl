@@ -1,14 +1,14 @@
 """
 Core data structures and utilities for FLiP.jl.
 
-Uses a lightweight PointCloudData struct instead of PointClouds.LAS
-for minimal memory overhead and O(1) attribute operations.
+Uses a lightweight `PointCloud` struct instead of `PointClouds.LAS` for
+minimal memory overhead and O(1) attribute operations.
 """
 
 # ── Point cloud struct ─────────────────────────────────────────────
 
 """
-    PointCloudData{T<:AbstractFloat}
+    PointCloud{T<:AbstractFloat}
 
 Lightweight point cloud container storing coordinates as an N×3 matrix
 and attributes as a `Dict{Symbol,Vector}`. Parametrized by coordinate
@@ -18,13 +18,10 @@ precision `T` (typically `Float32` or `Float64`).
 - `coords::Matrix{T}` — N×3 matrix of XYZ coordinates
 - `attrs::Dict{Symbol,Vector}` — named attribute vectors (e.g., `:intensity`, `:classification`)
 """
-mutable struct PointCloudData{T<:AbstractFloat}
+mutable struct PointCloud{T<:AbstractFloat}
     coords::Matrix{T}            # N×3
     attrs::Dict{Symbol,Vector}
 end
-
-const AbstractPointCloud = PointCloudData
-const PointCloud = PointCloudData
 
 # ── Type mappings for LAS extra byte dimensions ───────────────────
 
@@ -70,7 +67,7 @@ function addattribute(pc::PointCloud, name::Symbol, values::AbstractVector)
     length(values) == npoints(pc) || throw(ArgumentError("attribute :$name length $(length(values)) does not match point count $(npoints(pc))"))
     new_attrs = copy(pc.attrs)
     new_attrs[name] = collect(values)
-    return PointCloudData(pc.coords, new_attrs)
+    return PointCloud(pc.coords, new_attrs)
 end
 
 """Delete an attribute and return a new point cloud."""
@@ -78,7 +75,7 @@ function deleteattribute(pc::PointCloud, name::Symbol)
     haskey(pc.attrs, name) || return pc
     new_attrs = copy(pc.attrs)
     delete!(new_attrs, name)
-    return PointCloudData(pc.coords, new_attrs)
+    return PointCloud(pc.coords, new_attrs)
 end
 
 """Add or replace a scalar attribute. Returns a new point cloud (original is not mutated)."""
@@ -90,7 +87,7 @@ end
 
 function Base.getindex(pc::PointCloud, inds::AbstractVector{<:Integer})
     new_attrs = Dict{Symbol,Vector}(k => v[inds] for (k, v) in pc.attrs)
-    return PointCloudData(pc.coords[inds, :], new_attrs)
+    return PointCloud(pc.coords[inds, :], new_attrs)
 end
 
 # ── Coordinate replacement ─────────────────────────────────────────
@@ -100,7 +97,7 @@ function _replace_coordinates(pc::PointCloud, new_coords::AbstractMatrix{<:Real}
     n == npoints(pc) || throw(ArgumentError("new_coords row count must match number of points"))
     size(new_coords, 2) == 3 || throw(ArgumentError("new_coords must be N×3"))
     T = eltype(pc.coords)
-    return PointCloudData(T.(new_coords), copy(pc.attrs))
+    return PointCloud(T.(new_coords), copy(pc.attrs))
 end
 
 # ── Summary functions ──────────────────────────────────────────────
@@ -118,12 +115,12 @@ center(pc::PointCloud) = vec(mean(pc.coords, dims=1))
 
 # ── Display ────────────────────────────────────────────────────────
 
-function Base.show(io::IO, pc::PointCloudData)
-    print(io, "PointCloudData($(npoints(pc)) points, $(length(pc.attrs)) attributes)")
+function Base.show(io::IO, pc::PointCloud)
+    print(io, "PointCloud($(npoints(pc)) points, $(length(pc.attrs)) attributes)")
 end
 
-function Base.show(io::IO, ::MIME"text/plain", pc::PointCloudData)
-    println(io, "PointCloudData")
+function Base.show(io::IO, ::MIME"text/plain", pc::PointCloud)
+    println(io, "PointCloud")
     println(io, "  Points: $(npoints(pc))")
     attr_names = sort(collect(keys(pc.attrs)), by=string)
     print(io, "  Attributes: $(join(attr_names, ", "))")

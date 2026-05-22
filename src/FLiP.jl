@@ -62,7 +62,7 @@ include("main.jl")
 include("transformations.jl")
 
 # Export types
-export AbstractPointCloud, PointCloud
+export PointCloud
 
 # Export utility functions
 export npoints, coordinates, hasattribute, getattribute, setattribute!

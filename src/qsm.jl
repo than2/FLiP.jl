@@ -1365,10 +1365,10 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
         surf_coords = vcat(surface_parts...)
         surf_nbs = vcat(surface_nbs_parts...)
         surf_cv = vcat(surface_cv_parts...)
-        qsm_surface_cloud = PointCloudData(surf_coords, Dict{Symbol,Vector}(:tree_nbs_id => surf_nbs, :rho_cv => surf_cv))
+        qsm_surface_cloud = PointCloud(surf_coords, Dict{Symbol,Vector}(:tree_nbs_id => surf_nbs, :rho_cv => surf_cv))
         println("[qsm] Generated QSM surface cloud: $(npoints(qsm_surface_cloud)) points")
     else
-        qsm_surface_cloud = PointCloudData(Matrix{Float64}(undef, 0, 3), Dict{Symbol,Vector}())
+        qsm_surface_cloud = PointCloud(Matrix{Float64}(undef, 0, 3), Dict{Symbol,Vector}())
     end
 
     if !isempty(output_dir) && npoints(qsm_surface_cloud) > 0

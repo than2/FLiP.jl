@@ -171,7 +171,7 @@ function read_las(path::AbstractString; precision::DataType=coord_type())
     catch
     end
 
-    return PointCloudData(coords, attrs)
+    return PointCloud(coords, attrs)
 end
 
 const read_laz = read_las
@@ -355,7 +355,7 @@ coords = coordinates(pc)
 """
 function read_e57(path::AbstractString; scan_index::Int=-1, precision::DataType=coord_type())
     coords, attrs = _read_e57_to_raw(path; scan_index=scan_index, precision=precision)
-    return PointCloudData(coords, attrs)
+    return PointCloud(coords, attrs)
 end
 
 """

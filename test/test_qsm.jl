@@ -77,7 +77,7 @@
         ))
         tree_result = (
             pc_output=pc,
-            skeleton_cloud=FLiP.PointCloudData(zeros(Float64, 0, 3), Dict{Symbol,Vector}()),
+            skeleton_cloud=FLiP.PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}()),
             filtered_cloud=pc,
             n_components=1,
             neighbor_radius=0.1,

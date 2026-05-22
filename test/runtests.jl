@@ -12,7 +12,7 @@ function make_test_pointcloud(coords::AbstractMatrix{<:Real}; attrs=Dict{Symbol,
         pc_attrs[name] = vals
     end
     T = eltype(coords) <: AbstractFloat ? eltype(coords) : Float64
-    return FLiP.PointCloudData(T.(coords), pc_attrs)
+    return FLiP.PointCloud(T.(coords), pc_attrs)
 end
 
 @testset "FLiP.jl" begin

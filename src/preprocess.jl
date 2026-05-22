@@ -55,7 +55,7 @@ end
 Construct a PointCloud from raw coordinates and attribute vectors.
 """
 function _build_pointcloud_from_coords(coords::AbstractMatrix{<:AbstractFloat}, attrs::Dict{Symbol,Vector})
-    return PointCloudData(coords, attrs)
+    return PointCloud(coords, attrs)
 end
 
 """
