@@ -1,7 +1,3 @@
-@inline function _pipeline_output_path(output_dir::AbstractString, output_prefix::AbstractString, stem::AbstractString; fmt::AbstractString="las")
-    return joinpath(output_dir, "$(output_prefix)$(stem).$(fmt)")
-end
-
 @inline function _pipeline_write(path::AbstractString, pc::PointCloud)
     write_pc(path, pc)
     println("[main] wrote: $path")
@@ -24,24 +20,15 @@ Returns `nothing` if no matching files exist.
 """
 function _pipeline_load(output_dir::AbstractString, output_prefix::AbstractString, stem::AbstractString, fmt::AbstractString)
     # Try single-file first
-    single_path = joinpath(output_dir, "$(output_prefix)$(stem).$(fmt)")
+    single_path = get_output_path(output_dir, output_prefix, stem, fmt)
     if isfile(single_path)
         println("[main] resume: loading $single_path")
         return read_pc(single_path)
     end
 
     # Try multi-file _S{i} pattern
-    file_prefix = "$(output_prefix)$(stem)_S"
-    ext = "." * fmt
-    re_idx = Regex("_S(\\d+)\\." * replace(fmt, r"([.+*?^${}()|[\]\\])" => s"\\\1") * "\$", "i")
-    candidates = filter(readdir(output_dir; join=true)) do f
-        bn = basename(f)
-        startswith(bn, file_prefix) && endswith(lowercase(bn), ext)
-    end
+    candidates = find_scan_outputs(output_dir, output_prefix, stem, fmt)
     isempty(candidates) && return nothing
-
-    # Sort by scan index
-    sort!(candidates, by=f -> parse(Int, match(re_idx, basename(f)).captures[1]))
 
     println("[main] resume: loading $(length(candidates)) $(stem) files from $output_dir")
     all_coords = Vector{Matrix{<:AbstractFloat}}(undef, length(candidates))
@@ -118,7 +105,7 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     cfg.pipeline_output_dir = output_dir
 
     # 1) preprocess (reads input files, preprocesses each, writes individual outputs)
-    preprocess_path = _pipeline_output_path(output_dir, output_prefix, "preprocess"; fmt=output_fmt)
+    preprocess_path = get_output_path(output_dir, output_prefix, "preprocess", output_fmt)
     preprocess_written = false
     pc_preprocess = nothing
     if cfg.pipeline_enable_preprocess
@@ -131,8 +118,8 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     # 2) ground segmentation
     ground_points = nothing
     pc_agh = nothing
-    ground_path = _pipeline_output_path(output_dir, output_prefix, "ground"; fmt=output_fmt)
-    agh_path = _pipeline_output_path(output_dir, output_prefix, "agh"; fmt=output_fmt)
+    ground_path = get_output_path(output_dir, output_prefix, "ground", output_fmt)
+    agh_path = get_output_path(output_dir, output_prefix, "agh", output_fmt)
     ground_written = false
     agh_written = false
 
@@ -159,8 +146,8 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     end
 
     # 3) tree segmentation
-    tree_path = _pipeline_output_path(output_dir, output_prefix, "tree"; fmt=output_fmt)
-    tree_skeleton_path = _pipeline_output_path(output_dir, output_prefix, "skeleton"; fmt=output_fmt)
+    tree_path = get_output_path(output_dir, output_prefix, "tree", output_fmt)
+    tree_skeleton_path = get_output_path(output_dir, output_prefix, "skeleton", output_fmt)
     tree_written = false
     tree_skeleton_written = false
     tree_components = 0

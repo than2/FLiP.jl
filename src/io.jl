@@ -59,6 +59,47 @@ function _jl_to_numpy(vec::Vector{T}) where T
     return _np.array(Py(vec), copy=true)
 end
 
+# ── Output file-path helpers ──────────────────────────────────────
+
+"""
+    get_output_path(dir, prefix, stem, fmt) -> String
+
+Build the single-file output path `{dir}/{prefix}{stem}.{fmt}`. Pure string
+construction; does not touch the filesystem.
+"""
+get_output_path(dir::AbstractString, prefix::AbstractString, stem::AbstractString, fmt::AbstractString) =
+    joinpath(dir, "$(prefix)$(stem).$(fmt)")
+
+"""
+    get_scan_output_path(dir, prefix, stem, fmt, i) -> String
+
+Build the per-scan output path `{dir}/{prefix}{stem}_S{i}.{fmt}`. Used when a
+stage produces one output per input scan (multi-file mode).
+"""
+get_scan_output_path(dir::AbstractString, prefix::AbstractString, stem::AbstractString, fmt::AbstractString, i::Integer) =
+    joinpath(dir, "$(prefix)$(stem)_S$(i).$(fmt)")
+
+"""
+    find_scan_outputs(dir, prefix, stem, fmt) -> Vector{String}
+
+Return the sorted list of files in `dir` matching the
+`{prefix}{stem}_S{i}.{fmt}` pattern, sorted by `i`. Returns an empty vector
+if no matches exist. Used by resume logic to discover previously-written
+scan outputs.
+"""
+function find_scan_outputs(dir::AbstractString, prefix::AbstractString, stem::AbstractString, fmt::AbstractString)
+    isdir(dir) || return String[]
+    file_prefix = "$(prefix)$(stem)_S"
+    ext_lower   = "." * lowercase(fmt)
+    re_idx      = Regex("_S(\\d+)\\." * replace(fmt, r"([.+*?^\$\{\}\(\)\|\[\]\\])" => s"\\\1") * "\$", "i")
+    matches = filter(readdir(dir; join=true)) do f
+        bn = basename(f)
+        startswith(bn, file_prefix) && endswith(lowercase(bn), ext_lower)
+    end
+    sort!(matches, by = f -> parse(Int, match(re_idx, basename(f)).captures[1]))
+    return matches
+end
+
 # ── LAS field name mappings ────────────────────────────────────────
 
 # FLiP attr name → (laspy field name, Julia type)
