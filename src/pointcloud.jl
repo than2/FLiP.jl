@@ -73,6 +73,38 @@ function Base.getindex(pc::PointCloud, inds::AbstractVector{<:Integer})
     return PointCloud(pc.coords[inds, :], new_attrs)
 end
 
+# ── Merging ────────────────────────────────────────────────────────
+
+"""
+    merge_pointclouds(coords_list, attrs_list) -> PointCloud
+
+Concatenate a list of N×3 coordinate matrices and merge attribute dicts by
+key intersection (attributes present in *all* clouds are kept; others are
+dropped). With a single-element list, returns a PointCloud built from that
+element without any concatenation.
+"""
+function merge_pointclouds(coords_list::AbstractVector{<:AbstractMatrix},
+                           attrs_list::AbstractVector{<:Dict{Symbol,<:Vector}})
+    length(coords_list) == length(attrs_list) ||
+        throw(ArgumentError("coords_list and attrs_list must have the same length"))
+    isempty(coords_list) && throw(ArgumentError("cannot merge an empty list"))
+
+    if length(coords_list) == 1
+        return PointCloud(coords_list[1], Dict{Symbol,Vector}(attrs_list[1]))
+    end
+
+    common_keys = Set(keys(attrs_list[1]))
+    for a in @view attrs_list[2:end]
+        intersect!(common_keys, keys(a))
+    end
+    merged_attrs = Dict{Symbol,Vector}()
+    for k in common_keys
+        merged_attrs[k] = vcat((a[k] for a in attrs_list)...)
+    end
+    merged_coords = vcat(coords_list...)
+    return PointCloud(merged_coords, merged_attrs)
+end
+
 # ── Coordinate replacement ─────────────────────────────────────────
 
 function _replace_coordinates(pc::PointCloud, new_coords::AbstractMatrix{<:Real})

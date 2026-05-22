@@ -40,22 +40,9 @@ function _pipeline_load(output_dir::AbstractString, output_prefix::AbstractStrin
         all_attrs[i]  = _all_attributes(pc)
     end
 
-    if length(candidates) == 1
-        return _build_pointcloud_from_coords(all_coords[1], all_attrs[1])
-    end
-
-    # Merge
-    common_keys = Set(keys(all_attrs[1]))
-    for a in all_attrs[2:end]
-        intersect!(common_keys, keys(a))
-    end
-    merged_attrs = Dict{Symbol,Vector}()
-    for k in common_keys
-        merged_attrs[k] = vcat([a[k] for a in all_attrs]...)
-    end
-    merged_coords = vcat(all_coords...)
-    println("[main] resume: merged $(length(candidates)) scans → $(size(merged_coords, 1)) points")
-    return _build_pointcloud_from_coords(merged_coords, merged_attrs)
+    merged = merge_pointclouds(all_coords, all_attrs)
+    length(candidates) > 1 && println("[main] resume: merged $(length(candidates)) scans → $(npoints(merged)) points")
+    return merged
 end
 
 @inline function _pipeline_require(data, path::AbstractString, data_label::AbstractString, consumer_label::AbstractString)

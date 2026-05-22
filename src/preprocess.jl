@@ -117,22 +117,7 @@ function preprocess(; cfg::FLiPConfig=_CFG)
         all_attrs[i]  = _all_attributes(pc)
     end
 
-    # Single file: rebuild from extracted data (original pc is out of scope)
-    if n_files == 1
-        return _build_pointcloud_from_coords(all_coords[1], all_attrs[1])
-    end
-
-    # Merge: concatenate coordinates and common attributes
-    common_keys = Set(keys(all_attrs[1]))
-    for a in all_attrs[2:end]
-        intersect!(common_keys, keys(a))
-    end
-
-    merged_attrs = Dict{Symbol,Vector}()
-    for k in common_keys
-        merged_attrs[k] = vcat([a[k] for a in all_attrs]...)
-    end
-    merged_coords = vcat(all_coords...)
-    println("[preprocess] Merged $n_files scans → $(size(merged_coords, 1)) points")
-    return _build_pointcloud_from_coords(merged_coords, merged_attrs)
+    merged = merge_pointclouds(all_coords, all_attrs)
+    n_files > 1 && println("[preprocess] Merged $n_files scans → $(npoints(merged)) points")
+    return merged
 end
