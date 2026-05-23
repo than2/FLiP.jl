@@ -1,216 +1,250 @@
 """
-    _labels_to_sorted_clusters(subset, labels) -> Vector{Vector{Int}}
+Individual tree segmentation pipeline.
 
-Convert per-element CC labels (from `connected_component_subset!`) into a list of
-vertex-index vectors sorted by descending component size. Labels are already ranked
-(1 = largest) by `connected_component_subset!`, so `clusters[1]` is the largest.
-Vertices with label 0 (below `min_cc_size`) are dropped.
+Operates on a point cloud that already carries above-ground height (`:AGH`).
+The public entry point is [`tree_segmentation`](@ref); the file is laid out
+orchestrator-first, helpers below in call order.
+
+# Pipeline
+
+1. Filter to above-ground points (`:AGH > tree_nearground_agh_threshold`).
+2. Discover connected components via coordinate-only union-find (no graph),
+   to bound the per-component memory of all later steps.
+3. Process each component independently
+   ([`_process_single_connected_component`](@ref)):
+   3a. Build a radius graph for the component.
+   3b. Label Non-Branching Segments (NBS) via
+       [`label_non_branching_segments`](@ref) — greedy expansion from
+       near-ground seeds, linearity-constrained.
+   3c. Build a skeleton cloud + skeleton graph
+       ([`create_skeleton_cloud`](@ref)) — one vertex per NBS-node.
+   3d. Assemble NBS into trees ([`assemble_segments`](@ref)) — grow from
+       near-ground NBS along the skeleton graph using Rule A (new branch)
+       or Rule B (merge into existing NBS).
+4. Concatenate per-component skeletons into one cloud + graph.
+5. Cross-component orphan-NBS rescue
+   ([`process_orphan_segments`](@ref)).
+6. Re-order tree IDs by descending point count (largest tree → 1).
+7. Stamp `:nbs_id`, `:node_id`, `:tree_id`, `:tree_nbs_id` onto the cloud
+   and optionally write a CloudCompare-readable skeleton OBJ.
 """
-function _labels_to_sorted_clusters(subset::AbstractVector{Int}, labels::Vector{Int})
-    max_label = maximum(labels; init=0)
-    max_label == 0 && return Vector{Vector{Int}}()
-    clusters = [Int[] for _ in 1:max_label]
-    @inbounds for (i, v) in enumerate(subset)
-        lab = labels[i]
-        lab > 0 && push!(clusters[lab], v)
+
+# ── Entry point ───────────────────────────────────────────────────
+
+"""
+    tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG) -> NamedTuple
+
+Run the individual-tree segmentation workflow on a point cloud already
+carrying `:AGH` (above-ground height).
+
+Per-component processing keeps peak memory at O(N_largest_component × avg_degree)
+rather than O(N_total × avg_degree). Components are discovered by a lightweight
+coordinate-only union-find before any graph is built.
+
+# Returns
+
+`NamedTuple` with fields:
+- `filtered_cloud::PointCloud` — the above-ground points with `:nbs_id`,
+  `:node_id`, `:tree_id`, `:tree_nbs_id` attached
+- `pc_output::PointCloud` — alias of `filtered_cloud` (back-compat)
+- `skeleton_cloud::PointCloud` — concatenated per-component skeleton (one
+  vertex per NBS node), carrying `:node_id` and `:n_points`
+- `n_components::Int` — number of valid connected components processed
+- `neighbor_radius::Float64` — the radius used for component discovery /
+  per-component graph build
+
+See the file docstring for the seven-step pipeline outline.
+"""
+function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
+    hasattribute(pc, :AGH) || throw(ArgumentError(
+        "tree_segmentation requires AGH attribute on input point cloud"))
+
+    agh = getattribute(pc, :AGH)
+
+    # ── Step 1: filter to above-ground points ─────────────────────
+    threshold = cfg.tree_nearground_agh_threshold
+    nearground_idx = findall(i -> isfinite(float(agh[i])) && float(agh[i]) > threshold,
+                             eachindex(agh))
+    empty_result = (
+        filtered_cloud  = pc[1:0],
+        pc_output       = pc[1:0],
+        skeleton_cloud  = PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}()),
+        n_components    = 0,
+        neighbor_radius = 0.0,
+    )
+    isempty(nearground_idx) && return empty_result
+
+    pc_filtered     = pc[nearground_idx]
+    coords_filtered = coordinates(pc_filtered)
+    agh_filtered    = float.(getattribute(pc_filtered, :AGH))
+    N = size(coords_filtered, 1)
+
+    neighbor_radius = cfg.tree_neighbor_radius > 0 ?
+                      cfg.tree_neighbor_radius :
+                      2.0 * cfg.pipeline_subsample_res
+    neighbor_radius > 0 || throw(ArgumentError("tree neighbor radius must be > 0"))
+
+    # ── Step 2: discover components via coordinate-only union-find ──
+    cc_labels = connected_component_labels(coords_filtered, neighbor_radius,
+                                           cfg.tree_min_nbs_size)
+
+    # Build component → indices dispatch in one O(N) pass (was K× findall),
+    # then release the per-point label vector (~ 8N bytes).
+    cc_indices_dict = Dict{Int, Vector{Int}}()
+    @inbounds for i in eachindex(cc_labels)
+        cc_labels[i] > 0 || continue
+        push!(get!(cc_indices_dict, cc_labels[i], Int[]), i)
     end
-    return filter!(!isempty, clusters)
-end
+    cc_labels = Int[]   # free
 
-"""
-    _find_seed_clusters(points, agh_values, nearground_agh_ceiling, unlabeled_mask,
-                        graph, cc_workspace;
-                        is_first_iteration, z_sorted, z_cursor,
-                        frontier_buf, candidate_buf) -> Vector{Vector{Int}}
+    unique_ccs   = sort!(collect(keys(cc_indices_dict)))
+    n_components = length(unique_ccs)
+    @info "[tree_segmentation] $N filtered points → $n_components connected components" min_cc=cfg.tree_min_nbs_size
 
-Find seed clusters for `label_non_branching_segments`. Returns a list of vertex-index
-vectors sorted by descending cluster size (first iteration) or ascending z (subsequent).
+    n_components == 0 && return empty_result
 
-**First iteration**: collects all unlabeled vertices with AGH ≤ `nearground_agh_ceiling`,
-splits them into connected components via `connected_component_subset!`, and returns
-them ranked largest-first.
+    # ── Step 3: process each component independently ──────────────
+    global_nbs_id      = zeros(Int32, N)
+    global_node_id     = zeros(Int32, N)
+    global_tree_id     = zeros(Int32, N)
+    global_tree_nbs_id = zeros(Int32, N)
 
-**Subsequent iterations**: draws seeds from `frontier_buf` — rejected frontier CCs
-accumulated from prior `greedy_neighborhood_search` calls. Filters out
-already-labeled vertices, sorts the remainder by ascending z, and returns each as a
-single-point seed cluster. When `frontier_buf` is exhausted, falls back to the next
-lowest-z unlabeled point via `z_cursor` (O(1) amortised). Returns an empty vector when
-no unlabeled points remain (signals termination).
-"""
-function _find_seed_clusters(
-    points::AbstractMatrix{<:Real},
-    agh_values::AbstractVector{<:Real},
-    nearground_agh_ceiling::Float64,
-    unlabeled_mask::BitVector,
-    graph::SimpleGraph{Int},
-    cc_workspace::ConnectedComponentSubsetWorkspace;
-    is_first_iteration::Bool,
-    z_sorted::Vector{Int},
-    z_cursor::Ref{Int},
-    frontier_buf::Vector{Int},
-    candidate_buf::Vector{Int},
-)
-    empty!(candidate_buf)
+    all_skel_coords    = Matrix{eltype(coords_filtered)}[]
+    all_skel_attrs     = Dict{Symbol,Vector}[]
+    all_skel_edges     = Tuple{Int,Int}[]
+    skel_vertex_offset = 0
+    nbs_offset         = Int32(0)
+    node_offset        = Int32(0)
+    tree_offset        = Int32(0)
 
-    if is_first_iteration
-        # Collect all unlabeled near-ground vertices
-        @inbounds for v in eachindex(unlabeled_mask)
-            unlabeled_mask[v] || continue
-            float(agh_values[v]) <= nearground_agh_ceiling || continue
-            push!(candidate_buf, v)
+    for (ci, cc_id) in enumerate(unique_ccs)
+        cc_indices = cc_indices_dict[cc_id]
+        cc_n = length(cc_indices)
+        @info "[tree_segmentation]   component $ci/$n_components: $cc_n points"
+
+        cc_coords = coords_filtered[cc_indices, :]
+        cc_agh    = agh_filtered[cc_indices]
+
+        res = _process_single_connected_component(cc_coords, cc_agh, neighbor_radius; cfg=cfg)
+
+        # Map local → global labels with running offsets
+        local_nbs_max  = Int32(maximum(res.nbs_id;  init=0))
+        local_node_max = Int32(maximum(res.node_id; init=0))
+        local_tree_max = Int32(maximum(res.tree_id; init=0))
+        @inbounds for (li, gi) in enumerate(cc_indices)
+            nid  = res.nbs_id[li]
+            global_nbs_id[gi]     = nid  > 0 ? nid  + nbs_offset  : Int32(0)
+            noid = res.node_id[li]
+            global_node_id[gi]    = noid > 0 ? noid + node_offset : Int32(0)
+            tid  = res.tree_id[li]
+            global_tree_id[gi]    = tid  > 0 ? tid  + tree_offset : Int32(0)
+            tnid = res.tree_nbs_id[li]
+            global_tree_nbs_id[gi] = tnid > 0 ? tnid + nbs_offset  : Int32(0)
         end
-        if !isempty(candidate_buf)
-            labels = connected_component_subset!(cc_workspace, graph, candidate_buf)
-            return _labels_to_sorted_clusters(candidate_buf, labels)
+
+        # Accumulate skeleton cloud + edges with vertex offset
+        skel_cloud = res.skeleton_cloud
+        if npoints(skel_cloud) > 0
+            push!(all_skel_coords, coordinates(skel_cloud))
+            push!(all_skel_attrs, _all_attributes(skel_cloud))
+            for e in Graphs.edges(res.graph_skeleton)
+                push!(all_skel_edges, (src(e) + skel_vertex_offset,
+                                       dst(e) + skel_vertex_offset))
+            end
+            skel_vertex_offset += npoints(skel_cloud)
         end
+
+        nbs_offset  += local_nbs_max
+        node_offset += local_node_max
+        tree_offset += local_tree_max
+    end
+
+    empty!(cc_indices_dict)   # release after per-component loop
+
+    # ── Step 4: merge skeletons across components ─────────────────
+    if isempty(all_skel_coords)
+        merged_skel       = PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}())
+        merged_skel_graph = SimpleGraph{Int}(0)
     else
-        # Draw seeds from the rejected-frontier buffer.
-        # Filter out vertices that have been labeled since they were added.
-        @inbounds for v in frontier_buf
-            unlabeled_mask[v] && push!(candidate_buf, v)
-        end
-        empty!(frontier_buf)
-
-        if !isempty(candidate_buf)
-            # Sort by ascending z so growth proceeds upward from branch points
-            sort!(candidate_buf; by = v -> @inbounds(points[v, 3]))
-            return Vector{Int}[Int[v] for v in candidate_buf]
+        merged_skel       = merge_pointclouds(all_skel_coords, all_skel_attrs)
+        merged_skel_graph = SimpleGraph{Int}(skel_vertex_offset)
+        for (u, v) in all_skel_edges
+            add_edge!(merged_skel_graph, u, v)
         end
     end
+    # Release per-component skeleton accumulators before orphan rescue allocates
+    empty!(all_skel_coords); empty!(all_skel_attrs); empty!(all_skel_edges)
 
-    # Fallback: advance z_cursor to next unlabeled point (O(1) amortised)
-    while z_cursor[] <= length(z_sorted)
-        v = z_sorted[z_cursor[]]
-        z_cursor[] += 1
-        if unlabeled_mask[v]
-            return Vector{Int}[Int[v]]
-        end
+    # ── Step 5: cross-component orphan-NBS rescue ─────────────────
+    process_orphan_segments(coords_filtered, global_nbs_id,
+                            global_tree_id, global_tree_nbs_id; cfg=cfg)
+
+    # ── Step 6: reorder tree_id by descending point count ─────────
+    global_tree_id = relabel_by_occurrence(global_tree_id; positive_only=true, T_out=Int32)
+    tree_offset    = Int32(maximum(global_tree_id; init=0))
+
+    # ── Step 7: attach attributes + write skeleton OBJ ────────────
+    setattribute!(pc_filtered, :nbs_id,      global_nbs_id)
+    setattribute!(pc_filtered, :node_id,     global_node_id)
+    setattribute!(pc_filtered, :tree_id,     global_tree_id)
+    setattribute!(pc_filtered, :tree_nbs_id, global_tree_nbs_id)
+
+    if !isempty(cfg.pipeline_output_dir)
+        obj_path = joinpath(expanduser(cfg.pipeline_output_dir),
+                            "$(cfg.pipeline_output_prefix)skeleton_graph.obj")
+        _write_polyline_obj(obj_path, coordinates(merged_skel), merged_skel_graph)
+        @info "[tree_segmentation] wrote: $obj_path"
     end
 
-    # No unlabeled points remain — signal termination
-    return Vector{Vector{Int}}()
+    @info "[tree_segmentation] done" n_components=n_components n_trees=tree_offset n_nbs=nbs_offset
+
+    return (
+        filtered_cloud  = pc_filtered,
+        pc_output       = pc_filtered,
+        skeleton_cloud  = merged_skel,
+        n_components    = Int(n_components),
+        neighbor_radius = neighbor_radius,
+    )
 end
 
+# ── Per-component processing ──────────────────────────────────────
+
 """
-    connected_component_labels(graph::SimpleGraph{Int}, min_cc_size::Integer=1) -> Vector{Int}
+    _process_single_connected_component(cc_coords, cc_agh, neighbor_radius; cfg)
+        -> NamedTuple
 
-Label graph connected components by descending component size. Components smaller
-than `min_cc_size` receive label 0.
+Run the NBS → skeleton → assembly chain for one component. All four sub-stages
+share the same per-component radius graph. Returns NamedTuple fields:
+`nbs_id`, `node_id`, `tree_id`, `tree_nbs_id`, `skeleton_cloud`, `graph_skeleton`.
 """
-function connected_component_labels(graph::SimpleGraph{Int}, min_cc_size::Integer=1)
-    min_cc_size >= 1 || throw(ArgumentError("min_cc_size must be >= 1"))
-
-    n = nv(graph)
-    n == 0 && return Int[]
-
-    labels = zeros(Int, n)
-    components = connected_components(graph)
-    order = sortperm(length.(components); rev=true)
-
-    next_label = 1
-    for idx in order
-        comp = components[idx]
-        length(comp) >= min_cc_size || continue
-        @inbounds for v in comp
-            labels[v] = next_label
-        end
-        next_label += 1
-    end
-
-    return labels
+function _process_single_connected_component(cc_coords::AbstractMatrix{<:Real},
+                                             cc_agh::AbstractVector{<:Real},
+                                             neighbor_radius::Real;
+                                             cfg::FLiPConfig)
+    g_res    = build_radius_graph(cc_coords, neighbor_radius)
+    nbs_res  = label_non_branching_segments(g_res.graph, cc_coords, cc_agh; cfg=cfg)
+    skel_res = create_skeleton_cloud(g_res.graph, cc_coords, nbs_res.node_id)
+    asm_res  = assemble_segments(g_res.graph, cc_coords,
+                                 nbs_res.nbs_id, nbs_res.node_id, cc_agh,
+                                 skel_res.graph_skeleton, skel_res.skeleton_cloud;
+                                 cfg=cfg)
+    return (nbs_id         = nbs_res.nbs_id,
+            node_id        = nbs_res.node_id,
+            tree_id        = asm_res.tree_id,
+            tree_nbs_id    = asm_res.tree_nbs_id,
+            skeleton_cloud = skel_res.skeleton_cloud,
+            graph_skeleton = skel_res.graph_skeleton)
 end
 
-"""
-    generate_proto_nodes_from_slice_label(points, graph, slice_labels; min_cc_size=1)
-
-Generate proto-node labels from shortest-path slice labels using connected components
-from an already-built graph (no graph rebuild inside this function).
-"""
-function generate_proto_nodes_from_slice_label(points::AbstractMatrix{<:Real},
-                                               graph::SimpleGraph{Int},
-                                               slice_labels::AbstractVector{<:Integer};
-                                               min_cc_size::Integer=1,
-                                               cc_workspace::Union{Nothing, ConnectedComponentSubsetWorkspace}=nothing)
-    size(points, 2) == 3 || throw(ArgumentError("points must be N×3 matrix"))
-    n = size(points, 1)
-    nv(graph) == n || throw(ArgumentError("graph vertex count must match number of points"))
-    length(slice_labels) == n || throw(ArgumentError("slice_labels length must match number of points"))
-    min_cc_size >= 1 || throw(ArgumentError("min_cc_size must be >= 1"))
-
-    n == 0 && return Int[]
-
-    temp_labels = zeros(Int, n)
-    proto_nodes = zeros(Int, n)
-    odd_indices = Int[]
-    even_indices = Int[]
-
-    @inbounds for i in 1:n
-        label_i = Int(slice_labels[i])
-        if label_i > 0
-            if isodd(label_i)
-                push!(odd_indices, i)
-            else
-                push!(even_indices, i)
-            end
-        end
-    end
-
-    local_cc_workspace = isnothing(cc_workspace) ? ConnectedComponentSubsetWorkspace(nv(graph)) : cc_workspace
-
-    next_temp_label = 1
-    if !isempty(odd_indices)
-        odd_components = connected_component_subset!(local_cc_workspace, graph, odd_indices, min_cc_size)
-        @inbounds for (local_idx, point_idx) in enumerate(odd_indices)
-            temp_labels[point_idx] = odd_components[local_idx]
-        end
-        max_odd_label = isempty(odd_components) ? 0 : maximum(odd_components)
-        next_temp_label = max_odd_label + 1
-    end
-
-    if !isempty(even_indices)
-        even_components = connected_component_subset!(local_cc_workspace, graph, even_indices, min_cc_size)
-        @inbounds for (local_idx, point_idx) in enumerate(even_indices)
-            component_label = even_components[local_idx]
-            component_label > 0 || continue
-            temp_labels[point_idx] = next_temp_label + component_label - 1
-        end
-    end
-
-    component_to_proto = Dict{Int, Int}()
-    next_proto_label = 1
-    ordered_slices = sort!(collect(unique(Int(label) for label in slice_labels if label > 0)))
-
-    for slice_label in ordered_slices
-        seen_in_slice = Set{Int}()
-        @inbounds for i in 1:n
-            Int(slice_labels[i]) == slice_label || continue
-            temp_label = temp_labels[i]
-            temp_label == 0 && continue
-            temp_label in seen_in_slice && continue
-            push!(seen_in_slice, temp_label)
-            if !haskey(component_to_proto, temp_label)
-                component_to_proto[temp_label] = next_proto_label
-                next_proto_label += 1
-            end
-        end
-    end
-
-    @inbounds for i in 1:n
-        temp_label = temp_labels[i]
-        temp_label == 0 && continue
-        proto_nodes[i] = component_to_proto[temp_label]
-    end
-
-    return proto_nodes
-end
+# ── Step 3b: NBS labeling ─────────────────────────────────────────
 
 """
-    label_non_branching_segments(graph, points; cfg) -> NamedTuple
+    label_non_branching_segments(graph, points, agh_values; cfg) -> NamedTuple
 
-Segment every vertex of `graph` into non-branching segments (NBS) using
-`greedy_neighborhood_search`. Connected components smaller than
-`cfg.tree_min_nbs_size` are discarded upfront (label 0). Valid
-segments are relabeled by descending size (largest segment → label 1).
+Segment every vertex of `graph` into non-branching segments (NBS) by greedy
+neighborhood expansion. Connected components smaller than `cfg.tree_min_nbs_size`
+are discarded upfront (label 0). Valid segments are relabeled by descending
+size (largest segment → label 1).
 
 Returns `(nbs_id::Vector{Int32}, node_id::Vector{Int32})`.
 """
@@ -221,12 +255,12 @@ function label_non_branching_segments(
     cfg::FLiPConfig = _CFG,
 )
     N = nv(graph)
-    size(points, 1) == N || throw(ArgumentError("graph vertex count must match number of points"))
-    length(agh_values) == N || throw(ArgumentError("agh_values length must match graph vertex count"))
+    size(points, 1) == N     || throw(ArgumentError("graph vertex count must match number of points"))
+    length(agh_values) == N  || throw(ArgumentError("agh_values length must match graph vertex count"))
 
-    min_segment_size      = cfg.tree_min_nbs_size
-    neighbor_distance     = cfg.tree_nbs_neighbor_distance
-    max_iter              = cfg.tree_nbs_max_iterations
+    min_segment_size       = cfg.tree_min_nbs_size
+    neighbor_distance      = cfg.tree_nbs_neighbor_distance
+    max_iter               = cfg.tree_nbs_max_iterations
     nearground_agh_ceiling = cfg.tree_nearground_agh_threshold + 2.0 * cfg.pipeline_subsample_res
 
     global_nbs_id  = zeros(Int, N)
@@ -234,7 +268,7 @@ function label_non_branching_segments(
     gsws           = GreedySearchWorkspace(N)
     unlabeled_mask = trues(N)
 
-    # Pre-pass: discard isolated clusters smaller than min_segment_size in O(V+E).
+    # Pre-pass: discard isolated clusters smaller than min_segment_size (O(V+E)).
     for comp in connected_components(graph)
         length(comp) >= min_segment_size && continue
         @inbounds for v in comp
@@ -245,7 +279,7 @@ function label_non_branching_segments(
 
     # Pre-allocated buffers for _find_seed_clusters (reused across iterations)
     seed_candidate_buf = sizehint!(Int[], 1024)
-    frontier_buf       = sizehint!(Int[], 1024)  # rejected frontier CCs from greedy searches
+    frontier_buf       = sizehint!(Int[], 1024)   # rejected frontier CCs from greedy searches
 
     # Pre-sort by ascending z for fallback seed selection.
     z_sorted = sortperm(view(points, :, 3); rev=false)
@@ -253,7 +287,7 @@ function label_non_branching_segments(
 
     next_id          = 1
     next_global_node = 1
-    n_labeled_total  = count(!, unlabeled_mask)  # already labeled (discarded small CCs)
+    n_labeled_total  = count(!, unlabeled_mask)   # already labeled (discarded small CCs)
     last_pct_report  = 0
     t_nbs_start      = time()
 
@@ -268,7 +302,7 @@ function label_non_branching_segments(
             frontier_buf   = frontier_buf,
             candidate_buf  = seed_candidate_buf,
         )
-        isempty(seed_clusters) && break  # no unlabeled points remain
+        isempty(seed_clusters) && break   # no unlabeled points remain
 
         for start_vertices in seed_clusters
             # Skip if any point was already claimed by an earlier search this round
@@ -324,66 +358,103 @@ function label_non_branching_segments(
         end
     end
 
-    # Relabel by descending size: largest → 1, discarded → 0.
-    seg_sizes = Dict{Int, Int}()
-    for id in global_nbs_id
-        id > 0 || continue
-        seg_sizes[id] = get(seg_sizes, id, 0) + 1
-    end
-    sorted_segs = sort!(collect(keys(seg_sizes)); by = id -> -seg_sizes[id])
-    old_to_new  = Dict{Int, Int}(old => new for (new, old) in enumerate(sorted_segs))
-    @inbounds for i in eachindex(global_nbs_id)
-        id = global_nbs_id[i]
-        if id > 0
-            global_nbs_id[i] = old_to_new[id]
-        elseif id == -1
-            global_nbs_id[i] = 0
-        end
-    end
-
-    return (
-        nbs_id  = Int32.(global_nbs_id),
-        node_id = Int32.(global_node_id),
-    )
+    # Relabel valid segments by descending size; -1 (discarded) and 0 (unprocessed)
+    # both fall through `positive_only=true` to 0.
+    nbs_relabeled = relabel_by_occurrence(global_nbs_id; positive_only=true, T_out=Int32)
+    return (nbs_id = nbs_relabeled, node_id = Int32.(global_node_id))
 end
 
 """
-    _write_polyline_obj(path, coords, graph)
+    _find_seed_clusters(points, agh_values, nearground_agh_ceiling, unlabeled_mask,
+                        graph, cc_workspace;
+                        is_first_iteration, z_sorted, z_cursor,
+                        frontier_buf, candidate_buf) -> Vector{Vector{Int}}
 
-Write a skeleton graph as an OBJ polyline file readable by CloudCompare.
-Every edge is written as a separate `l u v` statement (1-indexed vertices).
+Find seed clusters for `label_non_branching_segments`. Returns a list of vertex-index
+vectors sorted by descending cluster size (first iteration) or ascending z (subsequent).
+
+**First iteration**: collects all unlabeled vertices with AGH ≤ `nearground_agh_ceiling`,
+splits them into connected components via `connected_component_subset!`, and returns
+them ranked largest-first.
+
+**Subsequent iterations**: draws seeds from `frontier_buf` — rejected frontier CCs
+accumulated from prior `greedy_neighborhood_search` calls. Filters out already-labeled
+vertices, sorts the remainder by ascending z, and returns each as a single-point seed
+cluster. When `frontier_buf` is exhausted, falls back to the next lowest-z unlabeled
+point via `z_cursor` (O(1) amortised). Returns an empty vector when no unlabeled points
+remain (signals termination).
 """
-function _write_polyline_obj(path::AbstractString, coords::AbstractMatrix{<:Real}, graph::SimpleGraph{Int})
-    open(path, "w") do io
-        println(io, "# FLiP.jl skeleton graph")
-        n = size(coords, 1)
-        for i in 1:n
-            println(io, "v $(Float64(coords[i, 1])) $(Float64(coords[i, 2])) $(Float64(coords[i, 3]))")
+function _find_seed_clusters(
+    points::AbstractMatrix{<:Real},
+    agh_values::AbstractVector{<:Real},
+    nearground_agh_ceiling::Float64,
+    unlabeled_mask::BitVector,
+    graph::SimpleGraph{Int},
+    cc_workspace::ConnectedComponentSubsetWorkspace;
+    is_first_iteration::Bool,
+    z_sorted::Vector{Int},
+    z_cursor::Ref{Int},
+    frontier_buf::Vector{Int},
+    candidate_buf::Vector{Int},
+)
+    empty!(candidate_buf)
+
+    if is_first_iteration
+        # Collect all unlabeled near-ground vertices
+        @inbounds for v in eachindex(unlabeled_mask)
+            unlabeled_mask[v] || continue
+            float(agh_values[v]) <= nearground_agh_ceiling || continue
+            push!(candidate_buf, v)
         end
-        for e in Graphs.edges(graph)
-            println(io, "l $(src(e)) $(dst(e))")
+        if !isempty(candidate_buf)
+            labels = connected_component_subset!(cc_workspace, graph, candidate_buf)
+            return group_indices_by_label(candidate_buf, labels)
+        end
+    else
+        # Draw seeds from the rejected-frontier buffer.
+        # Filter out vertices that have been labeled since they were added.
+        @inbounds for v in frontier_buf
+            unlabeled_mask[v] && push!(candidate_buf, v)
+        end
+        empty!(frontier_buf)
+
+        if !isempty(candidate_buf)
+            # Sort by ascending z so growth proceeds upward from branch points
+            sort!(candidate_buf; by = v -> @inbounds(points[v, 3]))
+            return Vector{Int}[Int[v] for v in candidate_buf]
         end
     end
-    return nothing
+
+    # Fallback: advance z_cursor to next unlabeled point (O(1) amortised)
+    while z_cursor[] <= length(z_sorted)
+        v = z_sorted[z_cursor[]]
+        z_cursor[] += 1
+        if unlabeled_mask[v]
+            return Vector{Int}[Int[v]]
+        end
+    end
+
+    # No unlabeled points remain — signal termination
+    return Vector{Vector{Int}}()
 end
+
+# ── Step 3c: skeleton construction ────────────────────────────────
 
 """
     create_skeleton_cloud(graph, coords_filtered, node_id; template_pc=nothing)
         -> NamedTuple{(:skeleton_cloud, :graph_skeleton)}
 
-Build a skeleton point cloud and an MST-pruned skeleton graph from NBS node
-assignments produced by `label_non_branching_segments`.
+Build a skeleton point cloud and skeleton graph from NBS node assignments produced
+by [`label_non_branching_segments`](@ref).
 
 Each non-zero node label `n` in `node_id` is represented in the skeleton by the
 centroid of all points assigned to that node. The returned `skeleton_cloud` carries
-extra per-point attributes `:node_id` (original node label) and `:n_points` (number
-of raw points contributing to that node centroid).
+per-point attributes `:node_id` (original node label) and `:n_points` (number of raw
+points contributing to the centroid).
 
-The skeleton graph has one vertex per node. An edge between nodes A and B is
-inserted for every point-level edge in `graph` that crosses the A/B node boundary.
-Edge weight is `1 / count` where `count` is the total number of such crossing
-point-pair connections (more connections -> lower weight -> preferred in MST).
-Kruskal MST is applied to remove cycles while keeping the strongest connections.
+The skeleton graph has one vertex per node. An edge is inserted between nodes A and B
+for every point-level edge in `graph` that crosses the A/B node boundary; the edge
+counts are tracked for completeness but no MST pruning is applied.
 """
 function create_skeleton_cloud(
     graph::SimpleGraph{Int},
@@ -395,19 +466,13 @@ function create_skeleton_cloud(
     size(coords_filtered, 1) == N || throw(ArgumentError("graph vertex count must match coords_filtered rows"))
     length(node_id) == N          || throw(ArgumentError("node_id length must match graph vertex count"))
 
-    # Find max node id
-    max_node = 0
-    @inbounds for i in 1:N
-        nid = Int(node_id[i])
-        nid > max_node && (max_node = nid)
-    end
-
+    max_node = Int(maximum(node_id; init=0))
     if max_node == 0
         empty_pc = PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}())
         return (skeleton_cloud=empty_pc, graph_skeleton=SimpleGraph{Int}(0))
     end
 
-    # Accumulate per-node coordinate sums and counts
+    # Per-node coordinate sums and counts
     node_sum = zeros(Float64, max_node, 3)
     node_cnt = zeros(Int, max_node)
     @inbounds for i in 1:N
@@ -419,10 +484,10 @@ function create_skeleton_cloud(
         node_cnt[nid] += 1
     end
 
-    # Keep only nodes with at least one point
+    # Keep only nodes with at least one point; build remap original → skeleton vertex
     valid_nodes  = [n for n in 1:max_node if node_cnt[n] > 0]
     n_nodes      = length(valid_nodes)
-    node_to_skel = zeros(Int, max_node)   # original node label -> skeleton vertex index
+    node_to_skel = zeros(Int, max_node)
     for (si, n) in enumerate(valid_nodes)
         node_to_skel[n] = si
     end
@@ -439,12 +504,11 @@ function create_skeleton_cloud(
         skel_nids[si] = Int32(n)
     end
 
-    # Build skeleton PointCloud
     skel_pc = PointCloud(skel_coords, Dict{Symbol,Vector}())
     setattribute!(skel_pc, :node_id,  skel_nids)
     setattribute!(skel_pc, :n_points, skel_npts)
 
-    # Count point-wise cross-node edge connections
+    # Count cross-node edge connections (informational; no MST pruning)
     edge_counts = Dict{Tuple{Int,Int}, Int}()
     @inbounds for e in Graphs.edges(graph)
         u  = src(e); v = dst(e)
@@ -456,9 +520,7 @@ function create_skeleton_cloud(
         edge_counts[key] = get(edge_counts, key, 0) + 1
     end
 
-    # Build skeleton graph — keep all cross-node edges (no MST pruning)
-    n_pairs = length(edge_counts)
-    if n_pairs == 0
+    if isempty(edge_counts)
         return (skeleton_cloud=skel_pc, graph_skeleton=SimpleGraph{Int}(n_nodes))
     end
 
@@ -470,12 +532,14 @@ function create_skeleton_cloud(
     return (skeleton_cloud=skel_pc, graph_skeleton=graph_skeleton)
 end
 
+# ── Step 3d: assembly ─────────────────────────────────────────────
+
 """
     assemble_segments(graph, coords, nbs_id, node_id, agh_values,
                       graph_skeleton, skeleton_cloud; cfg) -> NamedTuple
 
-Assemble non-branching segments (NBS) into individual trees by iteratively
-growing from near-ground seed NBS outward through the skeleton graph.
+Assemble non-branching segments into individual trees by iteratively growing
+from near-ground seed NBS outward through the skeleton graph.
 
 # Arguments
 - `graph::SimpleGraph{Int}`: point-level radius graph
@@ -483,9 +547,9 @@ growing from near-ground seed NBS outward through the skeleton graph.
 - `nbs_id::AbstractVector{<:Integer}`: per-point NBS label (0=discarded, 1..k)
 - `node_id::AbstractVector{<:Integer}`: per-point node label (globally unique)
 - `agh_values::AbstractVector{<:Real}`: per-point above-ground height
-- `graph_skeleton::SimpleGraph{Int}`: MST skeleton graph (one vertex per node)
+- `graph_skeleton::SimpleGraph{Int}`: skeleton graph (one vertex per node)
 - `skeleton_cloud::PointCloud`: skeleton point cloud with `:node_id` attribute
-- `cfg::FLiPConfig`: configuration (uses `tree_nearground_agh_threshold`)
+- `cfg::FLiPConfig`: uses `tree_nearground_agh_threshold`, `tree_assembly_merge_threshold`
 
 # Returns
 `(tree_nbs_id::Vector{Int32}, tree_id::Vector{Int32})` where `tree_id` is the
@@ -510,30 +574,23 @@ function assemble_segments(
     # Use the same near-ground ceiling as label_non_branching_segments:
     # threshold + 2× subsample resolution to account for discretisation
     nearground_ceiling = cfg.tree_nearground_agh_threshold + 2.0 * cfg.pipeline_subsample_res
-    merge_threshold = cfg.tree_assembly_merge_threshold
+    merge_threshold    = cfg.tree_assembly_merge_threshold
 
-    # ------------------------------------------------------------------
-    # Step 4.0: Initialise output arrays
-    # ------------------------------------------------------------------
     tree_id     = zeros(Int32, N)
     tree_nbs_id = Int32.(copy(nbs_id))
 
-    # ------------------------------------------------------------------
-    # Precomputation A: NBS → point indices
-    # ------------------------------------------------------------------
+    # ── Step 4.0: precomputations ────────────────────────────────
+    # (a) nbs_id → point indices
     nbs_points = Dict{Int, Vector{Int}}()
     @inbounds for i in 1:N
         nid = Int(nbs_id[i])
         nid > 0 || continue
-        pts = get!(nbs_points, nid, Int[])
-        push!(pts, i)
+        push!(get!(nbs_points, nid, Int[]), i)
     end
 
     isempty(nbs_points) && return (tree_nbs_id = tree_nbs_id, tree_id = tree_id)
 
-    # ------------------------------------------------------------------
-    # Precomputation B: node_id → skeleton vertex index
-    # ------------------------------------------------------------------
+    # (b) node_id → skeleton vertex index
     skel_node_ids = getattribute(skeleton_cloud, :node_id)
     n_skel = nv(graph_skeleton)
     node_to_skel = Dict{Int, Int}()
@@ -542,9 +599,7 @@ function assemble_segments(
         node_to_skel[Int(skel_node_ids[si])] = si
     end
 
-    # ------------------------------------------------------------------
-    # Precomputation C: skeleton vertex → NBS label
-    # ------------------------------------------------------------------
+    # (c) skeleton vertex → NBS label
     skel_to_nbs = zeros(Int, n_skel)
     @inbounds for i in 1:N
         nid = Int(node_id[i])
@@ -555,9 +610,7 @@ function assemble_segments(
         sv > 0 && (skel_to_nbs[sv] = sid)
     end
 
-    # ------------------------------------------------------------------
-    # Precomputation D: NBS → skeleton vertex set
-    # ------------------------------------------------------------------
+    # (d) NBS → skeleton vertex set
     nbs_skel_nodes = Dict{Int, Vector{Int}}()
     for sv in 1:n_skel
         nlab = skel_to_nbs[sv]
@@ -565,9 +618,7 @@ function assemble_segments(
         push!(get!(nbs_skel_nodes, nlab, Int[]), sv)
     end
 
-    # ------------------------------------------------------------------
-    # Precomputation E: NBS adjacency via point-level graph (connection counts)
-    # ------------------------------------------------------------------
+    # (e) NBS↔NBS adjacency via point-level graph (connection counts)
     nbs_adj = Dict{Int, Dict{Int, Int}}()
     @inbounds for e in Graphs.edges(graph)
         a = Int(nbs_id[src(e)])
@@ -579,51 +630,30 @@ function assemble_segments(
         inner_b[a] = get(inner_b, a, 0) + 1
     end
 
-    # ------------------------------------------------------------------
-    # Step 4.1: Seed trees from near-ground NBS
-    # ------------------------------------------------------------------
-    next_tree_id = Int32(1)
-    nbs_tree     = Dict{Int, Int32}()   # NBS label → tree_id
-    assigned_nbs = Set{Int}()
-
-    for (k, pts) in nbs_points
-        min_agh = Inf
-        @inbounds for i in pts
-            v = Float64(agh_values[i])
-            v < min_agh && (min_agh = v)
-        end
-        if min_agh <= nearground_ceiling
-            nbs_tree[k] = next_tree_id
-            push!(assigned_nbs, k)
-            @inbounds for i in pts
-                tree_id[i] = next_tree_id
-            end
-            next_tree_id += Int32(1)
-        end
-    end
+    # ── Step 4.1: seed trees from near-ground NBS ────────────────
+    seed_res = _seed_trees_from_nearground!(tree_id, nbs_points, agh_values, nearground_ceiling)
+    nbs_tree     = seed_res.nbs_tree
+    assigned_nbs = seed_res.assigned_nbs
+    next_tree_id = seed_res.next_tree_id   # currently unused after extraction; kept for future hooks
 
     @info "Assembly: seeded $(next_tree_id - 1) trees from near-ground NBS"
 
-    # ------------------------------------------------------------------
-    # Step 4.2: Iterative growth via skeleton graph
-    # ------------------------------------------------------------------
+    # ── Step 4.2: iterative growth via skeleton graph ────────────
     iteration = 0
     while true
         iteration += 1
 
-        # 4.2a: Find frontier NBS via skeleton graph
-        # For each assigned NBS, check skeleton neighbors for unassigned NBS
-        frontier_info = Dict{Int, Dict{Int32, Int}}()  # frontier_nbs → Dict(tree_id → connection_count)
+        # 4.2a: for each assigned NBS, scan its skeleton neighbors for unassigned NBS
+        frontier_info = Dict{Int, Dict{Int32, Int}}()   # frontier_nbs → Dict(tree_id → connection_count)
         for assigned_k in assigned_nbs
             skel_nodes_k = get(nbs_skel_nodes, assigned_k, Int[])
             for sv in skel_nodes_k
                 for sn in Graphs.neighbors(graph_skeleton, sv)
                     neighbor_nbs = skel_to_nbs[sn]
                     (neighbor_nbs > 0 && !(neighbor_nbs in assigned_nbs)) || continue
-                    # This is a frontier NBS — record connection to the assigned tree
                     tid = nbs_tree[assigned_k]
                     info = get!(frontier_info, neighbor_nbs, Dict{Int32, Int}())
-                    # Use point-level connection count for tie-breaking
+                    # Tie-break by point-level connection count
                     adj_inner = get(nbs_adj, neighbor_nbs, Dict{Int, Int}())
                     conn_count = get(adj_inner, assigned_k, 0)
                     info[tid] = get(info, tid, 0) + conn_count
@@ -631,50 +661,48 @@ function assemble_segments(
             end
         end
 
-        isempty(frontier_info) && break  # Step 4.4: no frontier → terminate
+        isempty(frontier_info) && break   # no frontier → terminate
 
-        # Sort frontier NBS by number of points (large to small)
+        # Sort frontier NBS by number of points (large → small)
         frontier_sorted = sort!(collect(keys(frontier_info));
                                 by = k -> -length(get(nbs_points, k, Int[])))
 
         n_assigned_this_round = 0
 
         for k in frontier_sorted
-            k in assigned_nbs && continue  # may have been assigned earlier this round
+            k in assigned_nbs && continue   # may have been assigned earlier this round
 
-            skel_nodes_k = get(nbs_skel_nodes, k, Int[])
+            skel_nodes_k     = get(nbs_skel_nodes, k, Int[])
             tree_connections = frontier_info[k]
-            n_total_nodes = length(skel_nodes_k)
+            n_total_nodes    = length(skel_nodes_k)
 
-            # Count how many nodes in this NBS connect to an existing tree NBS
+            # Count how many skeleton nodes in this NBS touch an already-assigned NBS
             n_nodes_with_tree_conn = 0
             for sv in skel_nodes_k
                 for sn in Graphs.neighbors(graph_skeleton, sv)
                     nbr_nbs = skel_to_nbs[sn]
                     if nbr_nbs != k && nbr_nbs in assigned_nbs
                         n_nodes_with_tree_conn += 1
-                        break  # only count each node once
+                        break   # count each node once
                     end
                 end
             end
 
-            # Determine best tree (most total point-level connections)
-            best_tree = Int32(0)
+            # Best tree = most total point-level connections
+            best_tree  = Int32(0)
             best_count = 0
             for (tid, cnt) in tree_connections
                 if cnt > best_count
                     best_count = cnt
-                    best_tree = tid
+                    best_tree  = tid
                 end
             end
-            best_tree == 0 && continue  # shouldn't happen for valid frontier
+            best_tree == 0 && continue   # shouldn't happen for a valid frontier
 
-            # Fraction of nodes connected to existing tree NBS
             frac_connected = n_total_nodes > 0 ? n_nodes_with_tree_conn / n_total_nodes : 0.0
 
             if frac_connected <= merge_threshold
-                # Rule A: Majority of nodes are internal / not connected to tree NBS
-                # → valid branch, assign entire NBS to best_tree
+                # Rule A: mostly internal nodes → assign as a new branch of best_tree
                 nbs_tree[k] = best_tree
                 push!(assigned_nbs, k)
                 pts = get(nbs_points, k, Int[])
@@ -683,10 +711,9 @@ function assemble_segments(
                 end
                 n_assigned_this_round += 1
             else
-                # Rule B: Over threshold fraction of nodes connect to tree NBS
-                # → merge entire NBS into the closest connected NBS by skeleton
-                #   edge count (most skeleton edges = closest connection)
-                skel_neighbor_counts = Dict{Int, Int}()  # neighbor NBS → skeleton edge count
+                # Rule B: straddles existing tree NBS → merge into the closest one
+                # by skeleton-edge count.
+                skel_neighbor_counts = Dict{Int, Int}()
                 for sv in skel_nodes_k
                     for sn in Graphs.neighbors(graph_skeleton, sv)
                         nbr_nbs = skel_to_nbs[sn]
@@ -695,25 +722,23 @@ function assemble_segments(
                     end
                 end
 
-                # Pick the connected NBS with the most skeleton edges
-                target_nbs = 0
+                target_nbs   = 0
                 target_count = 0
                 for (nbr_nbs, cnt) in skel_neighbor_counts
                     if cnt > target_count
                         target_count = cnt
-                        target_nbs = nbr_nbs
+                        target_nbs   = nbr_nbs
                     end
                 end
 
                 if target_nbs > 0
-                    # Adopt the target NBS's tree_id and nbs_id
                     target_tid = get(nbs_tree, target_nbs, Int32(0))
                     if target_tid == Int32(-1)
-                        target_tid = Int32(0)  # target was a split NBS, treat as unassigned
+                        target_tid = Int32(0)   # target was a split NBS; treat as unassigned
                     end
                     pts = get(nbs_points, k, Int[])
                     @inbounds for i in pts
-                        tree_id[i] = target_tid
+                        tree_id[i]     = target_tid
                         tree_nbs_id[i] = Int32(target_nbs)
                     end
                     nbs_tree[k] = target_tid
@@ -723,27 +748,22 @@ function assemble_segments(
             end
         end
 
-        # Step 4.4: Terminate if nothing new assigned
         n_assigned_this_round == 0 && break
 
         @info "Assembly iteration $iteration: assigned $n_assigned_this_round NBS" total_assigned=length(assigned_nbs)
     end
 
-    # ------------------------------------------------------------------
-    # Step 4.3: Re-order tree_nbs_id — continuous labels by descending size
-    # ------------------------------------------------------------------
-    # Group points by (tree_id, tree_nbs_id) — Rule B merges have already
-    # updated tree_nbs_id to the target NBS label during growth
+    # ── Step 4.3: re-order tree_nbs_id by descending (tree, NBS)-group size ─
+    # Rule B merges have already updated tree_nbs_id during growth, so groups are
+    # keyed by the final (tree_id, tree_nbs_id) pair.
     group_points = Dict{Tuple{Int32, Int32}, Vector{Int}}()
     @inbounds for i in 1:N
         tid = tree_id[i]
         nid = tree_nbs_id[i]
         (tid > 0 && nid > 0) || continue
-        key = (tid, nid)
-        push!(get!(group_points, key, Int[]), i)
+        push!(get!(group_points, (tid, nid), Int[]), i)
     end
 
-    # Sort groups by descending size, assign continuous labels from 1
     sorted_groups = sort!(collect(group_points); by = kv -> -length(kv[2]))
     global_label = Int32(1)
     for (_, pts) in sorted_groups
@@ -766,16 +786,55 @@ function assemble_segments(
 end
 
 """
+    _seed_trees_from_nearground!(tree_id, nbs_points, agh_values, nearground_ceiling)
+        -> NamedTuple
+
+For each NBS whose minimum AGH is at or below `nearground_ceiling`, assign a fresh
+tree id (1, 2, …) and mutate `tree_id` to that value for every point in the NBS.
+Returns `(nbs_tree::Dict{Int,Int32}, assigned_nbs::Set{Int}, next_tree_id::Int32)`.
+"""
+function _seed_trees_from_nearground!(tree_id::AbstractVector{Int32},
+                                      nbs_points::AbstractDict{Int,Vector{Int}},
+                                      agh_values::AbstractVector{<:Real},
+                                      nearground_ceiling::Real)
+    next_tree_id = Int32(1)
+    nbs_tree     = Dict{Int, Int32}()
+    assigned_nbs = Set{Int}()
+    ceiling_f64  = Float64(nearground_ceiling)
+
+    for (k, pts) in nbs_points
+        min_agh = Inf
+        @inbounds for i in pts
+            v = Float64(agh_values[i])
+            v < min_agh && (min_agh = v)
+        end
+        if min_agh <= ceiling_f64
+            nbs_tree[k] = next_tree_id
+            push!(assigned_nbs, k)
+            @inbounds for i in pts
+                tree_id[i] = next_tree_id
+            end
+            next_tree_id += Int32(1)
+        end
+    end
+
+    return (nbs_tree=nbs_tree, assigned_nbs=assigned_nbs, next_tree_id=next_tree_id)
+end
+
+# ── Step 5: orphan NBS rescue ─────────────────────────────────────
+
+"""
     process_orphan_segments(coords, nbs_id, tree_id, tree_nbs_id; cfg) -> nothing
 
-Rescue orphan NBS segments that were not assigned to any tree during per-component
-assembly. Operates across all components by building a coarse NBS-level graph from:
-  1. Radius graph among orphan points (occlusion_tolerance) → orphan↔orphan edges
-  2. KDTree search from orphan points to assigned points    → orphan↔tree edges
+Rescue orphan NBS that the per-component assembly never assigned to a tree.
+Builds a coarse NBS-level graph from two sources:
+  1. Radius graph among orphan points (`tree_assembly_occlusion_tolerance`)
+     — orphan↔orphan edges
+  2. KDTree search from orphan points to already-assigned points
+     — orphan↔tree edges
 
-Then iteratively propagates tree_id through the coarse graph.
-
-Modifies `tree_id` and `tree_nbs_id` in-place.
+then iteratively propagates `tree_id` through the coarse graph. Mutates
+`tree_id` and `tree_nbs_id` in place.
 """
 function process_orphan_segments(
     coords::AbstractMatrix{<:Real},
@@ -788,14 +847,14 @@ function process_orphan_segments(
     occlusion_tol = cfg.tree_assembly_occlusion_tolerance
     occlusion_tol > 0 || return nothing
 
-    # Identify orphan NBS (nbs_id > 0, all points have tree_id == 0)
+    # Identify orphan NBS (nbs_id > 0, all points unassigned)
     orphan_nbs_points = Dict{Int, Vector{Int}}()
     @inbounds for i in 1:N
         nid = Int(nbs_id[i])
         nid > 0 && tree_id[i] == 0 || continue
         push!(get!(orphan_nbs_points, nid, Int[]), i)
     end
-    # Remove NBS that have any assigned points (partially assigned = not orphan)
+    # Remove NBS that have any assigned points (partially assigned ≠ orphan)
     @inbounds for i in 1:N
         nid = Int(nbs_id[i])
         nid > 0 && tree_id[i] > 0 && delete!(orphan_nbs_points, nid)
@@ -804,27 +863,26 @@ function process_orphan_segments(
     isempty(orphan_nbs_points) && return nothing
 
     orphan_nbs_list = collect(keys(orphan_nbs_points))
-    n_orphan_nbs = length(orphan_nbs_list)
+    n_orphan_nbs    = length(orphan_nbs_list)
 
-    # Collect all orphan point indices
+    # Collect orphan point indices
     orphan_pt_idx = Int[]
     for pts in values(orphan_nbs_points)
         append!(orphan_pt_idx, pts)
     end
     n_orphan_pts = length(orphan_pt_idx)
 
-    # --- Source 1: radius graph among orphan points ---
-    @info "Orphan rescue: building radius graph for $n_orphan_pts orphan points (r=$occlusion_tol m)"
+    # ── Source 1: radius graph among orphan points ───────────────
+    @info "[tree_segmentation] orphan rescue: building radius graph for $n_orphan_pts orphan points (r=$occlusion_tol m)"
     orphan_coords = coords[orphan_pt_idx, :]
-    orphan_graph = build_radius_graph(orphan_coords, occlusion_tol).graph
+    orphan_graph  = build_radius_graph(orphan_coords, occlusion_tol).graph
 
-    # Build coarse NBS-level adjacency from orphan graph edges
     orphan_nbs_of_pt = zeros(Int, n_orphan_pts)
     @inbounds for (j, i) in enumerate(orphan_pt_idx)
         orphan_nbs_of_pt[j] = Int(nbs_id[i])
     end
 
-    coarse_adj = Dict{Int, Dict{Int, Int}}()  # nbs_a → nbs_b → count
+    coarse_adj = Dict{Int, Dict{Int, Int}}()   # nbs_a → nbs_b → count
     @inbounds for e in Graphs.edges(orphan_graph)
         a = orphan_nbs_of_pt[src(e)]
         b = orphan_nbs_of_pt[dst(e)]
@@ -835,7 +893,7 @@ function process_orphan_segments(
         inner_b[a] = get(inner_b, a, 0) + 1
     end
 
-    # --- Source 2: KDTree search from orphan points to assigned points ---
+    # ── Source 2: KDTree search from orphan points to assigned points ─
     assigned_idx = Int[]
     @inbounds for i in 1:N
         tree_id[i] > 0 && push!(assigned_idx, i)
@@ -851,46 +909,42 @@ function process_orphan_segments(
             assigned_3xM[3, j] = coords[i, 3]
         end
         kdtree = KDTree(assigned_3xM)
+        @info "[tree_segmentation] orphan rescue: KDTree query for orphan→tree connections"
 
-        # For each orphan NBS, find connections to assigned trees
-        # Use -tid as the coarse node for assigned trees (negative sentinel)
-        @info "Orphan rescue: searching KDTree for orphan→tree connections"
-        for (orph_nbs, orph_pts) in orphan_nbs_points
-            for i in orph_pts
-                query = SVector{3, Float64}(coords[i, 1], coords[i, 2], coords[i, 3])
-                hits = inrange(kdtree, query, occlusion_tol)
-                for j in hits
-                    aid = assigned_idx[j]
-                    tid = tree_id[aid]
-                    tid > 0 || continue
-                    inner = get!(coarse_adj, orph_nbs, Dict{Int, Int}())
-                    inner[-tid] = get(inner, -tid, 0) + 1
-                end
-            end
-        end
-
-        # Record (tree_id, tree_nbs_id) connections for later merge target.
-        # Nested by tid so the apply step can pick the best tnid *within best_tid*.
+        # Single pass through orphan points populates BOTH `coarse_adj` (sentinel -tid)
+        # AND `orphan_to_tree_nbs`. Previously this was two passes with duplicate
+        # `inrange` calls — fused for ~2× fewer KDTree queries on the orphan set.
         for (orph_nbs, orph_pts) in orphan_nbs_points
             tnbs_by_tid = Dict{Int32, Dict{Int32, Int}}()
             for i in orph_pts
                 query = SVector{3, Float64}(coords[i, 1], coords[i, 2], coords[i, 3])
                 hits = inrange(kdtree, query, occlusion_tol)
                 for j in hits
-                    aid = assigned_idx[j]
-                    tid_a = tree_id[aid]
-                    tnid  = tree_nbs_id[aid]
-                    (tid_a > 0 && tnid > 0) || continue
-                    inner = get!(tnbs_by_tid, tid_a, Dict{Int32, Int}())
-                    inner[tnid] = get(inner, tnid, 0) + 1
+                    aid  = assigned_idx[j]
+                    tid  = tree_id[aid]
+                    tnid = tree_nbs_id[aid]
+                    tid > 0 || continue
+                    inner = get!(coarse_adj, orph_nbs, Dict{Int,Int}())
+                    inner[-tid] = get(inner, -tid, 0) + 1
+                    tnid > 0 || continue
+                    tnbs_inner = get!(tnbs_by_tid, tid, Dict{Int32, Int}())
+                    tnbs_inner[tnid] = get(tnbs_inner, tnid, 0) + 1
                 end
             end
             isempty(tnbs_by_tid) || (orphan_to_tree_nbs[orph_nbs] = tnbs_by_tid)
         end
+        # `kdtree` and `assigned_3xM` go out of scope at the `end` of this `if`.
     end
 
-    # --- Iterative propagation on coarse graph ---
-    orphan_tree_id = Dict{Int, Int32}()
+    # Release Step-5 intermediates before the propagation loop allocates new dicts.
+    orphan_graph     = SimpleGraph{Int}(0)
+    orphan_coords    = zeros(eltype(coords), 0, 3)
+    empty!(orphan_nbs_of_pt)
+    empty!(orphan_pt_idx)
+    empty!(assigned_idx)
+
+    # ── Iterative propagation on coarse graph ─────────────────────
+    orphan_tree_id  = Dict{Int, Int32}()
     orphan_assigned = Set{Int}()
 
     orphan_iteration = 0
@@ -932,12 +986,12 @@ function process_orphan_segments(
         end
 
         n_rescued == 0 && break
-        @info "Orphan rescue iteration $orphan_iteration: rescued $n_rescued NBS"
+        @info "[tree_segmentation] orphan rescue iteration $orphan_iteration: rescued $n_rescued NBS"
     end
 
     # Apply orphan assignments to point-level arrays.
-    # `next_fresh_tnbs` allocates globally-unique labels for orphans whose
-    # `best_tid` has no nearby NBS (rescued purely via orphan→orphan propagation).
+    # `next_fresh_tnbs` allocates globally-unique labels for orphans whose `best_tid`
+    # has no nearby NBS (rescued purely via orphan→orphan propagation).
     next_fresh_tnbs = Int32(maximum(tree_nbs_id; init = Int32(0))) + Int32(1)
 
     for (orph_nbs, best_tid) in orphan_tree_id
@@ -946,12 +1000,12 @@ function process_orphan_segments(
         tnbs_by_tid = get(orphan_to_tree_nbs, orph_nbs, Dict{Int32, Dict{Int32, Int}}())
         tnbs_counts = get(tnbs_by_tid, best_tid, Dict{Int32, Int}())
 
-        best_tnbs = Int32(0)
+        best_tnbs     = Int32(0)
         best_tnbs_cnt = 0
         for (tnid, cnt) in tnbs_counts
             if cnt > best_tnbs_cnt
                 best_tnbs_cnt = cnt
-                best_tnbs = tnid
+                best_tnbs     = tnid
             end
         end
 
@@ -961,7 +1015,7 @@ function process_orphan_segments(
         end
 
         for i in orphan_nbs_points[orph_nbs]
-            tree_id[i] = best_tid
+            tree_id[i]     = best_tid
             tree_nbs_id[i] = best_tnbs
         end
     end
@@ -969,194 +1023,25 @@ function process_orphan_segments(
     return nothing
 end
 
+# ── Step 7: skeleton OBJ writer ───────────────────────────────────
+
 """
-    tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG) -> NamedTuple
+    _write_polyline_obj(path, coords, graph) -> nothing
 
-Run tree segmentation on points with AGH attribute.
-
-Uses per-component processing to avoid OOM: connected components are discovered
-via lightweight union-find first, then each component is processed independently
-(graph construction, NBS labeling, skeleton, assembly). This reduces peak memory
-from O(N_total × avg_degree) to O(N_largest_component × avg_degree).
+Write a skeleton graph as an OBJ polyline file readable by CloudCompare.
+Every edge is written as a separate `l u v` statement (1-indexed vertices).
 """
-function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
-    hasattribute(pc, :AGH) || throw(ArgumentError("tree_segmentation requires AGH attribute on input point cloud"))
-
-    coords = coordinates(pc)
-    agh = getattribute(pc, :AGH)
-
-    threshold = cfg.tree_nearground_agh_threshold
-    nearground_idx = findall(i -> isfinite(float(agh[i])) && float(agh[i]) > threshold, eachindex(agh))
-    empty_result = (
-        filtered_cloud=pc[1:0],
-        pc_output=pc[1:0],
-        skeleton_cloud=PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}()),
-        n_components=0,
-        neighbor_radius=0.0,
-    )
-    isempty(nearground_idx) && return empty_result
-
-    pc_filtered     = pc[nearground_idx]
-    coords_filtered = coordinates(pc_filtered)
-    agh_filtered    = float.(getattribute(pc_filtered, :AGH))
-    N = size(coords_filtered, 1)
-
-    neighbor_radius = cfg.tree_neighbor_radius > 0 ? cfg.tree_neighbor_radius : 2.0 * cfg.pipeline_subsample_res
-    neighbor_radius > 0 || throw(ArgumentError("tree neighbor radius must be > 0"))
-
-    # ── Discover connected components via lightweight union-find (no graph) ──
-    cc_labels = connected_component_labels(coords_filtered, neighbor_radius, cfg.tree_min_nbs_size)
-    # each cluster needs to at least have enough points to form a valid NBS, otherwise it's not worth processing
-    unique_ccs = sort(unique(filter(>(0), cc_labels)))
-    n_components = length(unique_ccs)
-    println("[tree_segmentation] $(N) filtered points → $(n_components) connected components (min_cc=$(cfg.tree_min_nbs_size))")
-
-    if n_components == 0
-        return empty_result
-    end
-
-    # ── Pre-allocate global result arrays ────────────────────────────────
-    global_nbs_id      = zeros(Int32, N)
-    global_node_id     = zeros(Int32, N)
-    global_tree_id     = zeros(Int32, N)
-    global_tree_nbs_id = zeros(Int32, N)
-
-    all_skel_coords = Matrix{eltype(coords_filtered)}[]
-    all_skel_attrs  = Dict{Symbol,Vector}[]
-    all_skel_edges  = Tuple{Int,Int}[]
-    skel_vertex_offset = 0
-    nbs_offset  = Int32(0)
-    node_offset = Int32(0)
-    tree_offset = Int32(0)
-
-    # ── Process each component independently ─────────────────────────────
-    for (ci, cc_id) in enumerate(unique_ccs)
-        cc_indices = findall(==(cc_id), cc_labels)
-        cc_n = length(cc_indices)
-
-        println("[tree_segmentation]   component $(ci)/$(n_components): $(cc_n) points")
-
-        cc_coords = coords_filtered[cc_indices, :]
-        cc_agh    = agh_filtered[cc_indices]
-
-        # Build graph only for this component
-        g_res = build_radius_graph(cc_coords, neighbor_radius)
-        cc_graph = g_res.graph
-
-        # NBS labeling
-        nbs_res = label_non_branching_segments(cc_graph, cc_coords, cc_agh; cfg=cfg)
-
-        # Skeleton construction
-        skel_res = create_skeleton_cloud(cc_graph, cc_coords, nbs_res.node_id)
-
-        # Assembly
-        asm_res = assemble_segments(
-            cc_graph, cc_coords, nbs_res.nbs_id, nbs_res.node_id, cc_agh,
-            skel_res.graph_skeleton, skel_res.skeleton_cloud; cfg=cfg,
-        )
-
-        # Map local labels → global with offsets
-        local_nbs_max  = Int32(maximum(nbs_res.nbs_id; init=0))
-        local_node_max = Int32(maximum(nbs_res.node_id; init=0))
-        local_tree_max = Int32(maximum(asm_res.tree_id; init=0))
-
-        @inbounds for (li, gi) in enumerate(cc_indices)
-            nid = nbs_res.nbs_id[li]
-            global_nbs_id[gi] = nid > 0 ? nid + nbs_offset : Int32(0)
-
-            noid = nbs_res.node_id[li]
-            global_node_id[gi] = noid > 0 ? noid + node_offset : Int32(0)
-
-            tid = asm_res.tree_id[li]
-            global_tree_id[gi] = tid > 0 ? tid + tree_offset : Int32(0)
-
-            tnid = asm_res.tree_nbs_id[li]
-            global_tree_nbs_id[gi] = tnid > 0 ? tnid + nbs_offset : Int32(0)
+function _write_polyline_obj(path::AbstractString, coords::AbstractMatrix{<:Real},
+                             graph::SimpleGraph{Int})
+    open(path, "w") do io
+        println(io, "# FLiP.jl skeleton graph")
+        n = size(coords, 1)
+        for i in 1:n
+            println(io, "v $(Float64(coords[i, 1])) $(Float64(coords[i, 2])) $(Float64(coords[i, 3]))")
         end
-
-        # Accumulate skeleton data with vertex offset
-        skel_cloud = skel_res.skeleton_cloud
-        if npoints(skel_cloud) > 0
-            push!(all_skel_coords, coordinates(skel_cloud))
-            push!(all_skel_attrs, _all_attributes(skel_cloud))
-            for e in Graphs.edges(skel_res.graph_skeleton)
-                push!(all_skel_edges, (src(e) + skel_vertex_offset, dst(e) + skel_vertex_offset))
-            end
-            skel_vertex_offset += npoints(skel_cloud)
-        end
-
-        nbs_offset  += local_nbs_max
-        node_offset += local_node_max
-        tree_offset += local_tree_max
-    end
-
-    # ── Merge skeleton clouds ────────────────────────────────────────────
-    if isempty(all_skel_coords)
-        merged_skel = PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}())
-        merged_skel_graph = SimpleGraph{Int}(0)
-    else
-        merged_skel_coords = vcat(all_skel_coords...)
-
-        # Merge attributes (keep only common keys)
-        common_keys = Set(keys(all_skel_attrs[1]))
-        for a in all_skel_attrs[2:end]
-            intersect!(common_keys, keys(a))
-        end
-        merged_skel_attrs = Dict{Symbol,Vector}()
-        for k in common_keys
-            merged_skel_attrs[k] = vcat([a[k] for a in all_skel_attrs]...)
-        end
-        merged_skel = PointCloud(merged_skel_coords, merged_skel_attrs)
-
-        # Build merged skeleton graph
-        merged_skel_graph = SimpleGraph{Int}(skel_vertex_offset)
-        for (u, v) in all_skel_edges
-            add_edge!(merged_skel_graph, u, v)
+        for e in Graphs.edges(graph)
+            println(io, "l $(src(e)) $(dst(e))")
         end
     end
-
-    # ── Orphan NBS rescue (cross-component, uses occlusion tolerance) ────
-    process_orphan_segments(coords_filtered, global_nbs_id, global_tree_id, global_tree_nbs_id; cfg=cfg)
-
-    # ── Reorder tree_id by descending point count ──────────────────────────
-    tree_counts = Dict{Int32, Int}()
-    @inbounds for tid in global_tree_id
-        tid > 0 || continue
-        tree_counts[tid] = get(tree_counts, tid, 0) + 1
-    end
-    if !isempty(tree_counts)
-        sorted_tids = sort!(collect(keys(tree_counts)); by=t -> -tree_counts[t])
-        old_to_new = Dict{Int32, Int32}()
-        for (new_id, old_id) in enumerate(sorted_tids)
-            old_to_new[old_id] = Int32(new_id)
-        end
-        @inbounds for i in eachindex(global_tree_id)
-            tid = global_tree_id[i]
-            global_tree_id[i] = tid > 0 ? old_to_new[tid] : Int32(0)
-        end
-        tree_offset = Int32(length(sorted_tids))
-    end
-
-    # ── Build output point cloud ─────────────────────────────────────────
-    setattribute!(pc_filtered, :nbs_id, global_nbs_id)
-    setattribute!(pc_filtered, :node_id, global_node_id)
-    setattribute!(pc_filtered, :tree_id, global_tree_id)
-    setattribute!(pc_filtered, :tree_nbs_id, global_tree_nbs_id)
-    pc_output = pc_filtered
-
-    if !isempty(cfg.pipeline_output_dir)
-        obj_path = joinpath(expanduser(cfg.pipeline_output_dir), "$(cfg.pipeline_output_prefix)skeleton_graph.obj")
-        _write_polyline_obj(obj_path, coordinates(merged_skel), merged_skel_graph)
-        println("[tree_segmentation] wrote: $obj_path")
-    end
-
-    println("[tree_segmentation] done: $(n_components) components, $(tree_offset) trees, $(nbs_offset) NBS segments")
-
-    return (
-        filtered_cloud  = pc_filtered,
-        pc_output       = pc_output,
-        skeleton_cloud  = merged_skel,
-        n_components    = Int(n_components),
-        neighbor_radius = neighbor_radius,
-    )
+    return nothing
 end

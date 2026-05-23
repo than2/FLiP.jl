@@ -20,6 +20,8 @@ Functions:
                                                      — NBS-style frontier expansion
 - `longest_linear_path(graph, points, root; edge_vectors)`
                                                      — root-origin angular linear path
+- `graph_connected_component_labels(graph, min_cc_size=1)`
+                                                     — vertex labels ranked by component size
 
 Workspaces (pre-allocated buffers for repeated calls; each is defined
 immediately above the function that uses it):
@@ -1868,4 +1870,40 @@ function _select_linear_neighbor(previous::Int, current::Int, candidates::Vector
     end
 
     return best
+end
+
+"""
+    graph_connected_component_labels(graph::SimpleGraph{Int},
+                                     min_cc_size::Integer=1) -> Vector{Int}
+
+Label graph connected components by descending component size. Components smaller
+than `min_cc_size` receive label `0`; valid components receive labels `1..K` with
+`1` = largest. Returns a `Vector{Int}` of length `nv(graph)`.
+
+Distinct from `connected_component_labels(points, max_distance, …)` in
+`pointcloud_utils.jl`, which builds a union-find over raw XYZ coordinates rather
+than operating on a pre-built graph.
+"""
+function graph_connected_component_labels(graph::SimpleGraph{Int},
+                                          min_cc_size::Integer=1)
+    min_cc_size >= 1 || throw(ArgumentError("min_cc_size must be >= 1"))
+
+    n = nv(graph)
+    n == 0 && return Int[]
+
+    labels = zeros(Int, n)
+    components = connected_components(graph)
+    order = sortperm(length.(components); rev=true)
+
+    next_label = 1
+    for idx in order
+        comp = components[idx]
+        length(comp) >= min_cc_size || continue
+        @inbounds for v in comp
+            labels[v] = next_label
+        end
+        next_label += 1
+    end
+
+    return labels
 end

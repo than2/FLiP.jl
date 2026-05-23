@@ -84,6 +84,9 @@ export distance_subsample
 # Export config
 export FLiPConfig, load_config!, coord_type
 
+# Export generic array utilities
+export relabel_by_occurrence, group_indices_by_label
+
 # Export filtering functions
 export statistical_filter
 export grid_zmin_filter, upward_conic_filter
@@ -101,6 +104,7 @@ export delaunay_triangulation_xy, cloud_to_mesh_distance_z
 
 # Export graph functions
 export connected_component_labels
+export graph_connected_component_labels
 export build_radius_graph
 export build_graph
 export ConnectedComponentSubsetWorkspace

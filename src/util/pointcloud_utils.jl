@@ -556,5 +556,5 @@ function connected_component_labels(points::AbstractMatrix{<:Real},
     @inbounds for i in eachindex(parent)
         parent[i] = _uf_find!(parent, i)
     end
-    return _filter_array_by_occurrence(parent, Int(min_cc_size))
+    return relabel_by_occurrence(parent, Int(min_cc_size))
 end

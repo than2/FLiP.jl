@@ -1,11 +1,12 @@
 """
-Generic array utilities used by point-cloud filtering.
+Generic array utilities used by point-cloud filtering and segmentation.
 
 Functions:
 - `_uf_find!(parent, i)`                        — union-find root lookup with path halving
 - `_uf_union!(parent, ranks, i, j)`             — union-find union by rank
-- `_filter_array_by_occurrence(arr, min_count=1)`
-                                                — re-label values by frequency rank; drop values below `min_count`
+- `relabel_by_occurrence(arr, min_count=1; positive_only, T_out)`
+                                                — re-label values by frequency rank; drop below `min_count`
+- `group_indices_by_label(indices, labels)`     — group integer indices by per-position labels
 """
 
 """
@@ -60,47 +61,79 @@ function _uf_union!(parent::Vector{Int}, ranks::Vector{Int}, i::Int, j::Int)
 end
 
 """
-    _filter_array_by_occurrence(arr::AbstractVector{T},
-                                min_count::Integer=1) -> Vector{Int}
+    relabel_by_occurrence(arr::AbstractVector{T}, min_count::Integer=1;
+                          positive_only::Bool=false,
+                          T_out::Type{<:Integer}=Int) -> Vector{T_out}
 
 Re-label every element of `arr` by the frequency rank of its value.
 
-Unique values in `arr` are ranked by descending occurrence count
-(ties broken by `isless` on the value). Each occurrence in `arr` is
-mapped to its rank index (`1` = most common, `2` = second most common,
-…). Values whose total count is below `min_count` are mapped to `0`,
-effectively filtering them out of the labelling.
+Unique values in `arr` are ranked by descending occurrence count (ties broken by
+`isless` on the value). Each occurrence is mapped to its rank index (`1` = most
+common, `2` = second most common, …). Values whose total count is below
+`min_count` are mapped to `0`.
 
-Used after a union-find pass to convert a `parent` vector (with each
-element pointing to its component root) into compact component labels
-sized by component support.
+When `positive_only=true`, non-positive values (≤ 0) are treated as the "drop"
+sentinel and map to `0` in the output regardless of count. Use this for label
+vectors where `0` means "unassigned" and negatives mean "discarded".
 
-Returns a fresh `Vector{Int}` the same length as `arr`; does not
-mutate the input.
+`T_out` controls the element type of the output vector.
+
+Returns a fresh `Vector{T_out}` the same length as `arr`; does not mutate input.
 """
-function _filter_array_by_occurrence(arr::AbstractVector{T},
-                                     min_count::Integer=1) where {T}
+function relabel_by_occurrence(arr::AbstractVector{T}, min_count::Integer=1;
+                               positive_only::Bool=false,
+                               T_out::Type{<:Integer}=Int) where {T}
     min_count >= 1 || throw(ArgumentError("min_count must be >= 1"))
 
     counts = Dict{T,Int}()
-    for v in arr
+    @inbounds for v in arr
+        positive_only && !(Int(v) > 0) && continue
         counts[v] = get(counts, v, 0) + 1
     end
 
     ranked = sort(collect(keys(counts)); by = v -> (-counts[v], v))
 
-    label_of = Dict{T,Int}()
-    next_label = 1
+    label_of = Dict{T,T_out}()
+    next_label = T_out(1)
     for v in ranked
-        if counts[v] >= min_count
-            label_of[v] = next_label
-            next_label += 1
-        end
+        counts[v] >= min_count || continue
+        label_of[v] = next_label
+        next_label += T_out(1)
     end
 
-    labels = Vector{Int}(undef, length(arr))
+    out = Vector{T_out}(undef, length(arr))
     @inbounds for (k, v) in enumerate(arr)
-        labels[k] = get(label_of, v, 0)
+        if positive_only && !(Int(v) > 0)
+            out[k] = T_out(0)
+        else
+            out[k] = get(label_of, v, T_out(0))
+        end
     end
-    return labels
+    return out
+end
+
+"""
+    group_indices_by_label(indices::AbstractVector{<:Integer},
+                           labels::AbstractVector{<:Integer};
+                           max_label::Int = maximum(labels; init=0))
+        -> Vector{Vector{Int}}
+
+Group `indices` by their per-position integer `labels` (same length). Returns one
+index vector per non-empty positive label, ordered by label value. Positions with
+label `0` are dropped. When `labels` was produced by a routine that already ranks
+labels (e.g. `connected_component_subset!` ranks by component size), the output
+preserves that order.
+"""
+function group_indices_by_label(indices::AbstractVector{<:Integer},
+                                labels::AbstractVector{<:Integer};
+                                max_label::Int = maximum(labels; init=0))
+    length(indices) == length(labels) ||
+        throw(ArgumentError("indices and labels must have the same length"))
+    max_label == 0 && return Vector{Vector{Int}}()
+    clusters = [Int[] for _ in 1:max_label]
+    @inbounds for (i, v) in enumerate(indices)
+        lab = Int(labels[i])
+        lab > 0 && push!(clusters[lab], Int(v))
+    end
+    return filter!(!isempty, clusters)
 end
