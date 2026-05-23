@@ -35,9 +35,8 @@ validate required pipeline fields, and create the output directory. Mutates
 function _stage_initialization(config_path::AbstractString)
     cfg = load_config!(String(config_path))
 
-    _expand_home(p) = startswith(strip(p), "~/") ? joinpath(homedir(), strip(p)[3:end]) : strip(p)
-    cfg.pipeline_input_path    = _expand_home(cfg.pipeline_input_path)
-    cfg.pipeline_output_dir    = _expand_home(cfg.pipeline_output_dir)
+    cfg.pipeline_input_path    = expanduser(strip(cfg.pipeline_input_path))
+    cfg.pipeline_output_dir    = expanduser(strip(cfg.pipeline_output_dir))
     cfg.pipeline_output_prefix = strip(cfg.pipeline_output_prefix)
 
     isempty(cfg.pipeline_input_path)    && throw(ArgumentError("pipeline.input_path must be set in config"))
@@ -214,7 +213,8 @@ function _prepare_stage_input(data, cfg::FLiPConfig, stem::AbstractString,
     scans = find_scan_outputs(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, stem, fmt)
     if !isempty(scans)
         @info "[main] resume: loading $(length(scans)) $stem files from $(cfg.pipeline_output_dir)"
-        all_coords = Vector{Matrix{<:AbstractFloat}}(undef, length(scans))
+        T = coord_type(cfg)
+        all_coords = Vector{Matrix{T}}(undef, length(scans))
         all_attrs  = Vector{Dict{Symbol,Vector}}(undef, length(scans))
         for (i, fpath) in enumerate(scans)
             @info "[main] resume: loading $fpath"
@@ -256,18 +256,13 @@ end
 
 # ── Memory release + summary (used by run_pipeline) ───────────────
 
-# Each _drop_*_clouds returns the same NamedTuple shape with heavy
-# point-cloud fields nulled, so the GC can reclaim memory while paths and
-# written flags are kept for the summary.
-_drop_preprocess_clouds(pp) = (cloud=nothing, path=pp.path, written=pp.written)
-_drop_ground_clouds(g) = (ground=nothing, agh=nothing,
-                          ground_path=g.ground_path, agh_path=g.agh_path,
-                          ground_written=g.ground_written, agh_written=g.agh_written,
-                          n_preprocess=g.n_preprocess, n_ground=g.n_ground)
-_drop_tree_clouds(t) = (result=nothing,
-                        tree_path=t.tree_path, skeleton_path=t.skeleton_path,
-                        tree_written=t.tree_written, skeleton_written=t.skeleton_written,
-                        n_components=t.n_components)
+# Each _drop_*_clouds nulls the heavy point-cloud fields in the stage's
+# NamedTuple so the GC can reclaim memory, while paths/written-flags/counts
+# survive for the summary. Using `merge` keeps these in lock-step with any
+# new fields added to the stage return shape.
+_drop_preprocess_clouds(pp) = merge(pp, (cloud=nothing,))
+_drop_ground_clouds(g)      = merge(g,  (ground=nothing, agh=nothing))
+_drop_tree_clouds(t)        = merge(t,  (result=nothing,))
 
 """
     _summarize(cfg, pp_output, g_output, t_output, q_output, r_output) -> NamedTuple

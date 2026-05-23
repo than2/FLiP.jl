@@ -52,6 +52,7 @@ include("io.jl")
 include("util/array_utils.jl")
 include("util/geometry_utils.jl")
 include("util/pointcloud_utils.jl")
+include("util/interpolation.jl")
 include("preprocess.jl")
 include("ground_segmentation.jl")
 include("mesh.jl")
@@ -93,6 +94,7 @@ export XY_polygon_filter
 export convex_hull_2d, buffer_polygon, polygon_area
 export crop_by_ground_polygon
 export ground_segmentation
+export interpolate_idw
 
 # Export mesh functions
 export delaunay_triangulation_xy, cloud_to_mesh_distance_z

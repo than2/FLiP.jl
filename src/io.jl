@@ -122,14 +122,22 @@ function find_scan_outputs(dir::AbstractString, prefix::AbstractString, stem::Ab
     isdir(dir) || return String[]
     file_prefix = "$(prefix)$(stem)_S"
     ext_lower   = "." * lowercase(fmt)
-    re_idx      = Regex("_S(\\d+)\\." * replace(fmt, r"([.+*?^\$\{\}\(\)\|\[\]\\])" => s"\\\1") * "\$", "i")
-    matches = filter(readdir(dir; join=true)) do f
-        bn = basename(f)
-        startswith(bn, file_prefix) && endswith(lowercase(bn), ext_lower)
+    # Anchored regex prevents prefixes containing _S\d+ (e.g. site "Site_S03_")
+    # from fooling the index extraction. Parse the index in-line so we never
+    # rely on a separate filter + match pair (where match could return nothing).
+    re = Regex("^" * _escape_regex(file_prefix) * "(\\d+)" *
+               _escape_regex(ext_lower) * "\$", "i")
+    pairs = Tuple{Int,String}[]
+    for f in readdir(dir; join=true)
+        m = match(re, basename(f))
+        m === nothing && continue
+        push!(pairs, (parse(Int, m.captures[1]), f))
     end
-    sort!(matches, by = f -> parse(Int, match(re_idx, basename(f)).captures[1]))
-    return matches
+    sort!(pairs, by=first)
+    return [p[2] for p in pairs]
 end
+
+_escape_regex(s::AbstractString) = replace(s, r"([.+*?^\$\{\}\(\)\|\[\]\\])" => s"\\\1")
 
 # ── LAS extra-byte type-code mappings ─────────────────────────────
 
@@ -384,6 +392,7 @@ function _read_e57_to_raw(path::AbstractString; scan_index::Int=-1, precision::D
             return (coords, attrs)
         end
     finally
+        e57_obj.close()
     end
 end
 

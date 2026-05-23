@@ -33,7 +33,12 @@ Base.length(pc::PointCloud) = npoints(pc)
 """Return coordinates as an N×3 matrix (element type matches coordinate precision)."""
 coordinates(pc::PointCloud) = pc.coords
 
-"""Return a copy of all scalar attributes."""
+"""
+Return a shallow copy of all scalar attributes — the outer `Dict` is fresh,
+but the inner `Vector`s are shared with `pc`. Safe for read-only uses and
+for downstream `vcat`-style merging (which allocates new vectors); not safe
+if a caller mutates the returned vectors in place.
+"""
 _all_attributes(pc::PointCloud) = copy(pc.attrs)
 
 """Check whether an attribute exists."""
@@ -94,9 +99,14 @@ function merge_pointclouds(coords_list::AbstractVector{<:AbstractMatrix},
     end
 
     common_keys = Set(keys(attrs_list[1]))
+    all_keys = Set(keys(attrs_list[1]))
     for a in @view attrs_list[2:end]
         intersect!(common_keys, keys(a))
+        union!(all_keys, keys(a))
     end
+    dropped = setdiff(all_keys, common_keys)
+    isempty(dropped) ||
+        @info "merge_pointclouds: dropping attributes missing from some scans: $(sort(collect(dropped); by=string))"
     merged_attrs = Dict{Symbol,Vector}()
     for k in common_keys
         merged_attrs[k] = vcat((a[k] for a in attrs_list)...)
@@ -119,11 +129,18 @@ end
 
 function bounds(pc::PointCloud)
     c = pc.coords
-    return (
-        minimum(c[:, 1]), maximum(c[:, 1]),
-        minimum(c[:, 2]), maximum(c[:, 2]),
-        minimum(c[:, 3]), maximum(c[:, 3]),
-    )
+    n = size(c, 1)
+    n > 0 || throw(ArgumentError("bounds: empty point cloud"))
+    xmin = xmax = c[1, 1]
+    ymin = ymax = c[1, 2]
+    zmin = zmax = c[1, 3]
+    @inbounds for i in 2:n
+        x = c[i, 1]; y = c[i, 2]; z = c[i, 3]
+        x < xmin && (xmin = x); x > xmax && (xmax = x)
+        y < ymin && (ymin = y); y > ymax && (ymax = y)
+        z < zmin && (zmin = z); z > zmax && (zmax = z)
+    end
+    return (xmin, xmax, ymin, ymax, zmin, zmax)
 end
 
 center(pc::PointCloud) = vec(mean(pc.coords, dims=1))

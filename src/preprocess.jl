@@ -1,5 +1,5 @@
 """
-    preprocess(; cfg::FLiPConfig=_CFG) -> PointCloud
+    preprocess(; cfg::FLiPConfig=_CFG) -> Union{PointCloud, Nothing}
 
 Discover, clean, and merge the input point clouds.
 
@@ -12,10 +12,10 @@ Workflow:
    `{prefix}preprocess_S{i}.{fmt}` per scan. For E57 inputs the subsample
    is applied to the raw coordinate matrix *before* building the
    `PointCloud`, to avoid materializing the full-size cloud in memory.
-3. Merge every per-scan `PointCloud` into a single one
-   (`merge_pointclouds` — vcat coords, intersect attribute keys).
-4. Return the merged cloud. The on-disk artifacts written in step 2 are
-   what downstream stages (and the resume path) consume.
+3. **Single-file**: return the in-memory cloud directly.
+   **Multi-file**: return `nothing`. The downstream stage reloads and
+   merges the per-scan files via `_prepare_stage_input`, which keeps peak
+   memory at one scan instead of `n_files × scan + merged`.
 """
 function preprocess(; cfg::FLiPConfig=_CFG)
     input_files = find_input_files(; cfg=cfg)
@@ -27,36 +27,27 @@ function preprocess(; cfg::FLiPConfig=_CFG)
 
     n_files = length(input_files)
     T = coord_type(cfg)
-    all_coords = Vector{Matrix{T}}(undef, n_files)
-    all_attrs  = Vector{Dict{Symbol,Vector}}(undef, n_files)
+    last_pc::Union{PointCloud{T}, Nothing} = nothing
 
     for (i, fpath) in enumerate(input_files)
-        println("[preprocess] Reading file $i/$n_files: $fpath")
+        @info "[preprocess] Reading file $i/$n_files: $fpath"
         ext = lowercase(splitext(fpath)[2])
 
-        if ext == ".e57" && cfg.pipeline_enable_preprocess && cfg.pipeline_enable_subsample
-            # For large E57 files: subsample on raw coords before building PointCloud
-            # to avoid peak memory from full-size LAS construction
+        if ext == ".e57" && cfg.pipeline_enable_preprocess
+            # For large E57 files: subsample/filter on raw coords before building
+            # PointCloud — avoids peak memory from full-size cloud construction.
+            # (Previously only triggered when subsample was also enabled, which
+            # left stat-filter-only E57 inputs on the full-cloud path.)
             coords, attrs = _read_e57_to_raw(fpath; precision=T)
-            n_raw = size(coords, 1)
-            println("[preprocess]   raw points: $n_raw, subsampling at $(cfg.pipeline_subsample_res)m...")
-            keep = distance_subsample(coords, cfg.pipeline_subsample_res)
-            coords = coords[keep, :]
-            for (k, v) in attrs
-                attrs[k] = v[keep]
-            end
-            println("[preprocess]   after subsample: $(size(coords, 1)) points")
+            @info "[preprocess]   raw points: $(size(coords, 1))"
+            coords, attrs = _apply_preprocess_filters(coords, attrs; cfg=cfg)
             pc = PointCloud(coords, attrs)
-
-            if cfg.preprocess_enable_statistical_filter
-                pc = pc[statistical_filter(coordinates(pc),
-                                           cfg.statistical_filter_k_neighbors,
-                                           cfg.statistical_filter_n_sigma)]
-            end
         else
             pc = read_pc(fpath)
             if cfg.pipeline_enable_preprocess
-                pc = _preprocess_single(pc; cfg=cfg)
+                coords, attrs = _apply_preprocess_filters(coordinates(pc),
+                                                          _all_attributes(pc); cfg=cfg)
+                pc = PointCloud(coords, attrs)
             end
         end
 
@@ -64,36 +55,47 @@ function preprocess(; cfg::FLiPConfig=_CFG)
         suffix = n_files > 1 ? "_S$(i)" : ""
         out_path = joinpath(output_dir, "$(output_prefix)preprocess$(suffix).$(output_fmt)")
         write_pc(out_path, pc)
-        println("[preprocess] Wrote: $out_path  ($(npoints(pc)) points)")
+        @info "[preprocess] Wrote: $out_path  ($(npoints(pc)) points)"
 
-        # Extract coords/attrs and release the PointCloud object
-        all_coords[i] = coordinates(pc)
-        all_attrs[i]  = _all_attributes(pc)
+        # Single-file: hold the cloud in memory and return it directly.
+        # Multi-file: rely on the on-disk per-scan files; downstream reloads
+        # via `_prepare_stage_input` rather than accumulating in memory.
+        if n_files == 1
+            last_pc = pc
+        end
     end
 
-    merged = merge_pointclouds(all_coords, all_attrs)
-    n_files > 1 && println("[preprocess] Merged $n_files scans → $(npoints(merged)) points")
-    return merged
+    if n_files > 1
+        @info "[preprocess] Wrote $n_files scan files; downstream stages will lazy-merge from disk"
+    end
+    return last_pc
 end
 
 # ── Per-scan helper ───────────────────────────────────────────────
 
 """
-    _preprocess_single(pc::PointCloud; cfg::FLiPConfig=_CFG) -> PointCloud
+    _apply_preprocess_filters(coords::AbstractMatrix, attrs::Dict; cfg::FLiPConfig=_CFG)
+        -> (Matrix, Dict)
 
-Apply the per-scan preprocessing steps to a single in-memory cloud:
-optional distance subsample, then optional statistical filter.
+Apply optional distance subsample + statistical filter to raw `(coords, attrs)`.
+Pure: returns new arrays, does not mutate the inputs.
+
+Used by both the LAS path (after `read_pc` → unpacked into raw arrays) and the
+E57 path (raw arrays straight from `_read_e57_to_raw`), so the two branches
+share a single filter implementation.
 """
-function _preprocess_single(pc::PointCloud; cfg::FLiPConfig=_CFG)
+function _apply_preprocess_filters(coords::AbstractMatrix, attrs::Dict; cfg::FLiPConfig=_CFG)
     if cfg.pipeline_enable_subsample
-        pc = pc[distance_subsample(coordinates(pc), cfg.pipeline_subsample_res)]
+        keep = distance_subsample(coords, cfg.pipeline_subsample_res)
+        coords = coords[keep, :]
+        attrs = Dict(k => v[keep] for (k, v) in attrs)
     end
-
     if cfg.preprocess_enable_statistical_filter
-        pc = pc[statistical_filter(coordinates(pc),
-                                   cfg.statistical_filter_k_neighbors,
-                                   cfg.statistical_filter_n_sigma)]
+        keep = statistical_filter(coords,
+                                  cfg.statistical_filter_k_neighbors,
+                                  cfg.statistical_filter_n_sigma)
+        coords = coords[keep, :]
+        attrs = Dict(k => v[keep] for (k, v) in attrs)
     end
-
-    return pc
+    return coords, attrs
 end

@@ -197,6 +197,22 @@
         end
     end
 
+    @testset "find_scan_outputs handles prefixes containing _S\\d+" begin
+        # Regression test for Stage 6.4: anchored regex prevents a prefix
+        # like "site_S03_" from causing the index extractor to capture "03"
+        # instead of the real scan suffix.
+        mktempdir() do d
+            for i in 0:2
+                touch(joinpath(d, "site_S03_preprocess_S$(i).las"))
+            end
+            out = FLiP.find_scan_outputs(d, "site_S03_", "preprocess", "las")
+            @test length(out) == 3
+            @test endswith(out[1], "_S0.las")
+            @test endswith(out[2], "_S1.las")
+            @test endswith(out[3], "_S2.las")
+        end
+    end
+
     # Cleanup
     rm(test_dir, recursive=true)
 end

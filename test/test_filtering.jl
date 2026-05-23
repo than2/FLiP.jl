@@ -284,4 +284,17 @@
         # Buffered [0,10]×[0,10] should be roughly (10+4)×(10+4) = 196 m²
         @test result.ground_area > 100.0
     end
+
+    @testset "Filter outputs are sorted Vector{Int} (Stage 2 contract)" begin
+        # The filter functions return integer index vectors per CLAUDE.md guideline.
+        pts = randn(1000, 3)
+        polygon = [-2.0 -2.0; 2.0 -2.0; 2.0 2.0; -2.0 2.0]
+
+        for idx in (rnn_filter(pts, 0.5),
+                    voxel_connected_component_filter(pts, 0.1),
+                    XY_polygon_filter(pts, polygon))
+            @test idx isa Vector{Int}
+            @test issorted(idx)
+        end
+    end
 end

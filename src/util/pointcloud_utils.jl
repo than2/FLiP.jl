@@ -127,16 +127,20 @@ function statistical_filter(points::AbstractMatrix{<:Real},
     # Build KDTree for efficient nearest neighbor queries
     tree = KDTree(points')  # NearestNeighbors expects D×N matrix
 
-    # Compute mean distance to k nearest neighbors for each point
+    # Compute mean distance to k nearest neighbors for each point.
+    # Per-iteration SVector keeps the query stack-allocated; inline sum avoids
+    # allocating `dists[2:end]`. Per-point KNN (rather than batch) keeps peak
+    # memory bounded — batching allocates O(N·k) result vectors.
     mean_dists = Vector{Float64}(undef, n)
 
     @inbounds for i in 1:n
-        # Query k+1 neighbors (includes the point itself)
-        idxs, dists = knn(tree, points[i, :], k_neighbors + 1)
-
-        # Skip the first neighbor (the point itself with distance 0)
-        neighbor_dists = dists[2:end]
-        mean_dists[i] = mean(neighbor_dists)
+        q = SVector(points[i, 1], points[i, 2], points[i, 3])
+        _, dists = knn(tree, q, k_neighbors + 1)
+        s = 0.0
+        for j in 2:length(dists)  # skip dists[1] (the point itself)
+            s += dists[j]
+        end
+        mean_dists[i] = s / (length(dists) - 1)
     end
 
     # Compute statistics
@@ -145,7 +149,12 @@ function statistical_filter(points::AbstractMatrix{<:Real},
     threshold = μ + n_sigma * σ
 
     # Filter points below threshold
-    return findall(d -> d <= threshold, mean_dists)
+    keep = Int[]
+    sizehint!(keep, n)
+    @inbounds for i in 1:n
+        mean_dists[i] <= threshold && push!(keep, i)
+    end
+    return keep
 end
 
 # ── Density filtering ─────────────────────────────────────────────
@@ -178,16 +187,17 @@ function rnn_filter(points::AbstractMatrix{<:Real}, radius::Real;
     n == 0 && return Int[]
 
     tree = KDTree(points')
-    keep = falses(n)
+    keep = Int[]
+    sizehint!(keep, n)
 
     @inbounds for i in 1:n
-        neighbors = inrange(tree, points[i, :], radius)
-        if length(neighbors) >= min_rnn_size
-            keep[i] = true
+        q = SVector(points[i, 1], points[i, 2], points[i, 3])
+        if length(inrange(tree, q, radius)) >= min_rnn_size
+            push!(keep, i)
         end
     end
 
-    return findall(keep)
+    return keep
 end
 
 # ── Spatial-grid filtering ────────────────────────────────────────
@@ -198,7 +208,9 @@ end
 Grid minimum-z filter returning one index per XY cell.
 
 The XY plane is partitioned into square cells of size `grid_size`, and only
-the point with minimum z value in each cell is kept.
+the point with minimum z value in each cell is kept. Ties in z are broken
+by minimum point index, so the output is deterministic across runs on the
+same input.
 
 # Arguments
 - `points`: N×3 matrix of XYZ coordinates
@@ -315,15 +327,16 @@ function voxel_connected_component_filter(points::AbstractMatrix{<:Real}, voxel_
     end
 
     # --- Step 5: Keep points whose component meets the size threshold ---
-    keep = falses(n)
+    keep = Int[]
+    sizehint!(keep, n)
     @inbounds for i in 1:n
         root = _uf_find!(parent, voxel_id[voxel_of[i]])
         if get(comp_npts, root, 0) >= min_cc_size
-            keep[i] = true
+            push!(keep, i)
         end
     end
 
-    return findall(keep)
+    return keep
 end
 
 # ── Cone-based filtering ──────────────────────────────────────────
@@ -339,6 +352,11 @@ local XY neighborhood (within `max_search_radius`) that lie inside its
 upward cone:
 - `Δz = zj - zi > 0`
 - `r_xy <= Δz * tan(cone_theta_deg)`
+
+**Order-dependent**: results depend on input row order because the first
+point in each region wins as the anchor. LAS files may be in arbitrary
+scan order; for fully reproducible output, sort points by z first (which
+also tends to give better-quality ground anchors).
 
 # Arguments
 - `points`: N×3 matrix of XYZ coordinates
@@ -371,6 +389,8 @@ function upward_conic_filter(points::AbstractMatrix{<:Real}, cone_theta_deg::Rea
     tan_theta = tan(deg2rad(float(cone_theta_deg)))
     max_search_radius = float(max_search_delta_z) * tan_theta
     max_search_radius2 = max_search_radius * max_search_radius
+    # BitVector is load-bearing here: the inner loop reads `keep[target]` to
+    # short-circuit already-suppressed points. Do not replace with Vector{Int}.
     keep = trues(n)
 
     # Process points in input order and scan only local XY bins of future targets.
@@ -450,7 +470,8 @@ function XY_polygon_filter(points::AbstractMatrix{<:Real}, polygon::AbstractMatr
     n == 0 && return Int[]
     m >= 3 || throw(ArgumentError("polygon must have at least 3 vertices"))
 
-    keep = falses(n)
+    keep = Int[]
+    sizehint!(keep, n)
 
     @inbounds for i in 1:n
         px = Float64(points[i, 1])
@@ -474,10 +495,10 @@ function XY_polygon_filter(points::AbstractMatrix{<:Real}, polygon::AbstractMatr
             j = k
         end
 
-        keep[i] = inside
+        inside && push!(keep, i)
     end
 
-    return findall(keep)
+    return keep
 end
 
 # ── Connected-component labelling ─────────────────────────────────
@@ -522,7 +543,8 @@ function connected_component_labels(points::AbstractMatrix{<:Real},
     ranks  = zeros(Int, n)
 
     @inbounds for i in 1:n
-        neighbors_i = inrange(tree, vec(@view points[i, :]), radius)
+        q = SVector(points[i, 1], points[i, 2], points[i, 3])
+        neighbors_i = inrange(tree, q, radius)
         for j in neighbors_i
             j > i || continue
             _uf_union!(parent, ranks, i, j)

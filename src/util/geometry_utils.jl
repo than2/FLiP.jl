@@ -43,6 +43,12 @@ end
 
 # ── Polygon buffer ────────────────────────────────────────────────
 
+# Floor on cos(half-angle) at near-degenerate vertices: prevents the bisector
+# offset (buffer / cos_half) from exploding into a long spike. 0.1 corresponds
+# to an interior angle ≲ 12°, which convex hulls of ground returns essentially
+# never produce; tuned empirically.
+const _BUFFER_COS_HALF_FLOOR = 0.1
+
 """
     buffer_polygon(polygon::AbstractMatrix{<:Real}, buffer::Real) -> Matrix{Float64}
 
@@ -93,7 +99,7 @@ function buffer_polygon(polygon::AbstractMatrix{<:Real}, buffer::Real)
 
         # Scale factor: buffer / cos(half_angle) where cos(half_angle) = dot(n1, bisector)
         cos_half = n1x * bx + n1y * by
-        cos_half = max(cos_half, 0.1)  # clamp to avoid extreme spikes
+        cos_half = max(cos_half, _BUFFER_COS_HALF_FLOOR)
         offset = buffer / cos_half
 
         result[i, 1] = polygon[i, 1] + bx * offset

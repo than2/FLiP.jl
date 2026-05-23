@@ -9,8 +9,8 @@ Run the ground-segmentation workflow:
    clips the working cloud to the buffered convex hull of the ground
    points.
 3. If `cfg.pipeline_enable_agh`: [`calculate_aboveground_height`](@ref)
-   interpolates ground z onto an XY grid (IDW) and stamps `:AGH` onto
-   the (possibly cropped) cloud.
+   pointwise-IDW interpolates ground z at each query XY and stamps `:AGH`
+   onto the (possibly cropped) cloud.
 
 Returns a `NamedTuple` with fields:
 - `ground_points`: segmented ground `PointCloud`
@@ -50,11 +50,18 @@ function ground_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
             idw_k=cfg.pipeline_idw_k,
             idw_power=cfg.pipeline_idw_power,
         )
-        setattribute!(pc_use, :AGH, agh)
-        return (ground_points=ground_points, aboveground_height=agh, agh_cloud=pc_use, ground_area=ground_area)
+        # addattribute returns a new PointCloud sharing pc_use.coords — avoids
+        # leaking :AGH onto the caller's input cloud when crop is disabled.
+        pc_use = addattribute(pc_use, :AGH, agh)
+        return (ground_points=ground_points, aboveground_height=agh,
+                agh_cloud=pc_use, ground_area=ground_area, agh_computed=true)
     end
 
-    return (ground_points=ground_points, aboveground_height=Float64[], agh_cloud=pc_use, ground_area=ground_area)
+    # AGH disabled: agh_cloud is the most-processed cloud available (possibly
+    # cropped, but without :AGH). `agh_computed=false` lets callers
+    # distinguish this from a real AGH run.
+    return (ground_points=ground_points, aboveground_height=Float64[],
+            agh_cloud=pc_use, ground_area=ground_area, agh_computed=false)
 end
 
 # ── Step 1: segment ground points ─────────────────────────────────
@@ -76,9 +83,11 @@ function segment_ground(pc::PointCloud;
     coords = coordinates(pc)
 
     idx1 = voxel_connected_component_filter(coords, voxel_size, min_cc_size=min_cc_size)
-    idx2_local = grid_zmin_filter(coords[idx1, :], grid_size)
+    # @view avoids materializing intermediate copies of `coords`; for a 50M-point
+    # cloud at Float64 each copy would be ≈ 1.2 GB.
+    idx2_local = grid_zmin_filter(@view(coords[idx1, :]), grid_size)
     idx2 = idx1[idx2_local]
-    idx3_local = upward_conic_filter(coords[idx2, :], cone_theta_deg)
+    idx3_local = upward_conic_filter(@view(coords[idx2, :]), cone_theta_deg)
     idx_final = idx2[idx3_local]
     return pc[idx_final]
 end
@@ -133,16 +142,37 @@ end
 # ── Step 3: above-ground height ───────────────────────────────────
 
 """
-    calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud; xy_resolution::Real, idw_k::Int=8, idw_power::Real=2.0)
-        -> Vector{Float64}
+    calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud;
+        xy_resolution::Real, idw_k::Int=8, idw_power::Real=2.0,
+        ground_polygon::Union{Nothing,AbstractMatrix}=nothing) -> Vector{Float64}
 
-Interpolate `ground_points` onto an XY lattice using IDW, then compute
-`z_point - z_ground_nearest_xy` for all points in `pc`.
+Compute above-ground height (AGH) for each point in `pc` by interpolating
+`ground_points` z values at the query XY via [`interpolate_idw`](@ref), then
+returning `z_query - z_interp`.
+
+`xy_resolution` controls the maximum allowed distance from a query to its
+nearest known ground point: queries whose nearest ground sample is farther
+than `sqrt(2) * xy_resolution` get NaN. This preserves the spirit of the
+older grid-based cap (the diagonal of one grid cell) without materializing
+the intermediate grid.
+
+If `ground_polygon` is provided (M×2 vertex matrix), points outside the
+polygon also get NaN — useful when caller did not crop the cloud to the
+ground footprint and wants AGH masked off outside it.
+
+# Arguments
+- `pc`: query cloud (N points)
+- `ground_points`: known ground samples (≥ 3 required)
+- `xy_resolution`: governs the "too far from ground" cap (must be > 0)
+- `idw_k`: IDW neighbors (must be ≥ 1)
+- `idw_power`: IDW exponent (must be > 0)
+- `ground_polygon`: optional XY polygon for outside-footprint NaN masking
 """
 function calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud;
                                       xy_resolution::Real,
                                       idw_k::Int=8,
-                                      idw_power::Real=2.0)
+                                      idw_power::Real=2.0,
+                                      ground_polygon::Union{Nothing,AbstractMatrix}=nothing)
     npoints(ground_points) >= 3 || throw(ArgumentError(
         "ground_points must contain at least 3 points for interpolation; got $(npoints(ground_points))"))
     xy_resolution > 0 || throw(ArgumentError("xy_resolution must be > 0"))
@@ -152,123 +182,39 @@ function calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud;
     ground_coords = coordinates(ground_points)
     size(ground_coords, 2) == 3 || throw(ArgumentError("ground_points coordinates must be N×3 matrix"))
 
-    n_ground = size(ground_coords, 1)
-    ground_xy = Matrix{Float64}(undef, 2, n_ground)
-    ground_z = Vector{Float64}(undef, n_ground)
-
-    xmin = Inf
-    xmax = -Inf
-    ymin = Inf
-    ymax = -Inf
-
-    @inbounds for i in 1:n_ground
-        x = float(ground_coords[i, 1])
-        y = float(ground_coords[i, 2])
-        z = float(ground_coords[i, 3])
-        (isfinite(x) && isfinite(y) && isfinite(z)) ||
-            throw(ArgumentError("ground_points contain non-finite values"))
-
-        ground_xy[1, i] = x
-        ground_xy[2, i] = y
-        ground_z[i] = z
-
-        xmin = min(xmin, x)
-        xmax = max(xmax, x)
-        ymin = min(ymin, y)
-        ymax = max(ymax, y)
-    end
-
-    step = float(xy_resolution)
-    nx = max(1, floor(Int, (xmax - xmin) / step) + 1)
-    ny = max(1, floor(Int, (ymax - ymin) / step) + 1)
-    n_grid = nx * ny
-
-    sampled_ground = Matrix{Float64}(undef, n_grid, 3)
-    ground_tree = KDTree(ground_xy)
-    k_use = min(idw_k, n_ground)
-    p = float(idw_power)
-
-    idx = 1
-    @inbounds for iy in 0:(ny - 1)
-        y = ymin + iy * step
-        for ix in 0:(nx - 1)
-            x = xmin + ix * step
-
-            nbr_idx, nbr_dist = knn(ground_tree, SVector(x, y), k_use, true)
-
-            z_interp = NaN
-            exact_found = false
-            for j in eachindex(nbr_idx)
-                if nbr_dist[j] <= eps(Float64)
-                    z_interp = ground_z[nbr_idx[j]]
-                    exact_found = true
-                    break
-                end
-            end
-
-            if !exact_found
-                wsum = 0.0
-                zwsum = 0.0
-                for j in eachindex(nbr_idx)
-                    d = nbr_dist[j]
-                    w = 1.0 / (d^p)
-                    wsum += w
-                    zwsum += w * ground_z[nbr_idx[j]]
-                end
-                z_interp = wsum > 0 ? (zwsum / wsum) : NaN
-            end
-
-            sampled_ground[idx, 1] = x
-            sampled_ground[idx, 2] = y
-            sampled_ground[idx, 3] = z_interp
-            idx += 1
-        end
-    end
-
     points = coordinates(pc)
     size(points, 2) == 3 || throw(ArgumentError("points must be N×3 matrix"))
-    size(sampled_ground, 2) == 3 || throw(ArgumentError("sampled_ground must be N×3 matrix"))
-
-    n_sampled = size(sampled_ground, 1)
-    n_sampled > 0 || throw(ArgumentError("sampled_ground must contain at least one point"))
-
-    sampled_xy = Matrix{Float64}(undef, 2, n_sampled)
-    sampled_z = Vector{Float64}(undef, n_sampled)
-    @inbounds for i in 1:n_sampled
-        x = float(sampled_ground[i, 1])
-        y = float(sampled_ground[i, 2])
-        z = float(sampled_ground[i, 3])
-        (isfinite(x) && isfinite(y) && isfinite(z)) ||
-            throw(ArgumentError("sampled_ground contains non-finite values"))
-        sampled_xy[1, i] = x
-        sampled_xy[2, i] = y
-        sampled_z[i] = z
-    end
-
-    sampled_tree = KDTree(sampled_xy)
     n = size(points, 1)
-    aboveground_height = Vector{Float64}(undef, n)
-    max_xy_distance = sqrt(2.0) * float(xy_resolution)
 
-    @inbounds for i in 1:n
-        xq = float(points[i, 1])
-        yq = float(points[i, 2])
+    # Pointwise IDW directly on query XY — no intermediate regular grid.
+    # interpolate_idw handles non-finite queries and the max-distance cap.
+    z_interp = interpolate_idw(@view(ground_coords[:, 1:2]),
+                               @view(ground_coords[:, 3]),
+                               @view(points[:, 1:2]);
+                               k=idw_k, power=idw_power,
+                               max_distance=sqrt(2.0) * float(xy_resolution))
+
+    agh = Vector{Float64}(undef, n)
+    @inbounds Threads.@threads for i in 1:n
         zq = float(points[i, 3])
-
-        if !(isfinite(xq) && isfinite(yq) && isfinite(zq))
-            aboveground_height[i] = NaN
-            continue
+        if !isfinite(zq) || !isfinite(z_interp[i])
+            agh[i] = NaN
+        else
+            agh[i] = zq - z_interp[i]
         end
-
-        idxs, dists = knn(sampled_tree, SVector(xq, yq), 1, true)
-        d = dists[1]
-        if d > max_xy_distance
-            aboveground_height[i] = NaN
-            continue
-        end
-
-        aboveground_height[i] = zq - sampled_z[idxs[1]]
     end
 
-    return aboveground_height
+    # Optional: NaN out points outside the ground footprint polygon.
+    if ground_polygon !== nothing
+        inside_idx = XY_polygon_filter(points, ground_polygon)
+        inside_mask = falses(n)
+        @inbounds for i in inside_idx
+            inside_mask[i] = true
+        end
+        @inbounds for i in 1:n
+            inside_mask[i] || (agh[i] = NaN)
+        end
+    end
+
+    return agh
 end
