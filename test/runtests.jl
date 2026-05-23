@@ -23,6 +23,7 @@ end
     include("test_interpolation.jl")
     include("test_mesh.jl")
     include("test_graph.jl")
+    include("test_array_utils.jl")
     include("test_tree_segmentation.jl")
     include("test_main.jl")
     include("test_transformations.jl")

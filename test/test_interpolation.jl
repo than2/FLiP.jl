@@ -112,4 +112,10 @@ end
         @test agh_masked[n_gnd + 1] ≈ 5.0 atol=0.5  # (5, 5) inside
         @test isnan(agh_masked[n_gnd + 2])           # (2.5, 7.5) outside
     end
+
+    @testset "input validation" begin
+        @test_throws ArgumentError calculate_aboveground_height(pc, ground_pc; xy_resolution=0.0)
+        @test_throws ArgumentError calculate_aboveground_height(pc, ground_pc; xy_resolution=0.5, idw_k=0)
+        @test_throws ArgumentError calculate_aboveground_height(pc, ground_pc; xy_resolution=0.5, idw_power=0.0)
+    end
 end

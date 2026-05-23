@@ -189,10 +189,6 @@
         agh = calculate_aboveground_height(pc, pc_segmented; xy_resolution=0.5)
         @test length(agh) == length(pc)
         @test any(isfinite, agh)
-
-        @test_throws ArgumentError calculate_aboveground_height(pc, pc_segmented; xy_resolution=0.0)
-        @test_throws ArgumentError calculate_aboveground_height(pc, pc_segmented; xy_resolution=0.5, idw_k=0)
-        @test_throws ArgumentError calculate_aboveground_height(pc, pc_segmented; xy_resolution=0.5, idw_power=0.0)
     end
 
     @testset "Convex hull 2D" begin
