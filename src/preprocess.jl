@@ -1,72 +1,24 @@
 """
-    _preprocess_single(pc::PointCloud; cfg::FLiPConfig=_CFG) -> PointCloud
-
-Prepare a single point cloud before ground segmentation:
-1. Optional distance-based subsampling
-2. Optional statistical filtering
-"""
-function _preprocess_single(pc::PointCloud; cfg::FLiPConfig=_CFG)
-    active = cfg.pipeline_enable_subsample ? distance_subsample(pc, cfg.pipeline_subsample_res) : pc
-
-    if cfg.preprocess_enable_statistical_filter
-        active = statistical_filter(
-            active,
-            cfg.statistical_filter_k_neighbors,
-            cfg.statistical_filter_n_sigma,
-        )
-    end
-
-    return active
-end
-
-"""
-    discover_input_files(; cfg::FLiPConfig=_CFG) -> Vector{String}
-
-Find input point cloud files based on config settings.
-
-If `pipeline_input_path` points to a single file, returns `[input_path]`.
-If it points to a directory, returns all files matching
-`{input_prefix}*.{input_format}` sorted alphabetically.
-"""
-function discover_input_files(; cfg::FLiPConfig=_CFG)
-    input_path = cfg.pipeline_input_path
-    prefix = cfg.pipeline_input_prefix
-    fmt = lowercase(cfg.pipeline_input_format)
-
-    # Single file mode
-    if isfile(input_path)
-        return [input_path]
-    end
-
-    # Directory mode
-    isdir(input_path) || error("input_path is not a file or directory: $input_path")
-    ext = "." * fmt
-    files = sort(filter(readdir(input_path; join=true)) do f
-        bn = basename(f)
-        startswith(bn, prefix) && endswith(lowercase(bn), ext)
-    end)
-    isempty(files) && error("No .$(fmt) files matching prefix '$(prefix)' found in: $input_path")
-    return files
-end
-
-"""
-    _build_pointcloud_from_coords(coords::AbstractMatrix{<:AbstractFloat}, attrs::Dict{Symbol,Vector}) -> PointCloud
-
-Construct a PointCloud from raw coordinates and attribute vectors.
-"""
-function _build_pointcloud_from_coords(coords::AbstractMatrix{<:AbstractFloat}, attrs::Dict{Symbol,Vector})
-    return PointCloud(coords, attrs)
-end
-
-"""
     preprocess(; cfg::FLiPConfig=_CFG) -> PointCloud
 
-Discover input files, preprocess each individually (subsample + filter),
-write individual outputs with `_S{i}` suffix, and return a merged point cloud
-for downstream pipeline stages.
+Discover, clean, and merge the input point clouds.
+
+Workflow:
+1. Discover input files via [`find_input_files`](@ref) — either a single
+   path or every file in a directory matching `{input_prefix}*.{input_format}`.
+2. For each file: read it, optionally distance-subsample, optionally
+   statistical-filter, and write a per-scan output. Single-file runs
+   produce `{prefix}preprocess.{fmt}`; multi-file runs produce
+   `{prefix}preprocess_S{i}.{fmt}` per scan. For E57 inputs the subsample
+   is applied to the raw coordinate matrix *before* building the
+   `PointCloud`, to avoid materializing the full-size cloud in memory.
+3. Merge every per-scan `PointCloud` into a single one
+   (`merge_pointclouds` — vcat coords, intersect attribute keys).
+4. Return the merged cloud. The on-disk artifacts written in step 2 are
+   what downstream stages (and the resume path) consume.
 """
 function preprocess(; cfg::FLiPConfig=_CFG)
-    input_files = discover_input_files(; cfg=cfg)
+    input_files = find_input_files(; cfg=cfg)
     output_dir = cfg.pipeline_output_dir
     output_prefix = cfg.pipeline_output_prefix
     output_fmt = lowercase(cfg.pipeline_output_format)
@@ -88,16 +40,18 @@ function preprocess(; cfg::FLiPConfig=_CFG)
             coords, attrs = _read_e57_to_raw(fpath; precision=T)
             n_raw = size(coords, 1)
             println("[preprocess]   raw points: $n_raw, subsampling at $(cfg.pipeline_subsample_res)m...")
-            keep = distance_subsample_indices(coords, cfg.pipeline_subsample_res)
+            keep = distance_subsample(coords, cfg.pipeline_subsample_res)
             coords = coords[keep, :]
             for (k, v) in attrs
                 attrs[k] = v[keep]
             end
             println("[preprocess]   after subsample: $(size(coords, 1)) points")
-            pc = _build_pointcloud_from_coords(coords, attrs)
+            pc = PointCloud(coords, attrs)
 
             if cfg.preprocess_enable_statistical_filter
-                pc = statistical_filter(pc, cfg.statistical_filter_k_neighbors, cfg.statistical_filter_n_sigma)
+                pc = pc[statistical_filter(coordinates(pc),
+                                           cfg.statistical_filter_k_neighbors,
+                                           cfg.statistical_filter_n_sigma)]
             end
         else
             pc = read_pc(fpath)
@@ -120,4 +74,26 @@ function preprocess(; cfg::FLiPConfig=_CFG)
     merged = merge_pointclouds(all_coords, all_attrs)
     n_files > 1 && println("[preprocess] Merged $n_files scans → $(npoints(merged)) points")
     return merged
+end
+
+# ── Per-scan helper ───────────────────────────────────────────────
+
+"""
+    _preprocess_single(pc::PointCloud; cfg::FLiPConfig=_CFG) -> PointCloud
+
+Apply the per-scan preprocessing steps to a single in-memory cloud:
+optional distance subsample, then optional statistical filter.
+"""
+function _preprocess_single(pc::PointCloud; cfg::FLiPConfig=_CFG)
+    if cfg.pipeline_enable_subsample
+        pc = pc[distance_subsample(coordinates(pc), cfg.pipeline_subsample_res)]
+    end
+
+    if cfg.preprocess_enable_statistical_filter
+        pc = pc[statistical_filter(coordinates(pc),
+                                   cfg.statistical_filter_k_neighbors,
+                                   cfg.statistical_filter_n_sigma)]
+    end
+
+    return pc
 end

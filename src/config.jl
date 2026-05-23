@@ -14,17 +14,17 @@ Mutable struct holding package-wide default parameters for all filtering functio
 Modify fields directly or reload from a TOML file with `load_config!`.
 """
 mutable struct FLiPConfig
-    # statistical_filter / statistical_filter_indices
+    # statistical_filter
     statistical_filter_k_neighbors::Int
     statistical_filter_n_sigma::Float64
 
-    # voxel_connected_component_filter_indices
+    # voxel_connected_component_filter
     voxel_cc_filter_min_cc_size::Int
 
-    # upward_conic_filter_indices
+    # upward_conic_filter
     upward_conic_filter_max_search_delta_z::Float64
 
-    # rnn_filter / rnn_filter_indices
+    # rnn_filter
     rnn_filter_min_rnn_size::Int
 
     # segment_ground

@@ -59,7 +59,38 @@ function _jl_to_numpy(vec::Vector{T}) where T
     return _np.array(Py(vec), copy=true)
 end
 
-# ── Output file-path helpers ──────────────────────────────────────
+# ── Input/output file-path helpers ────────────────────────────────
+
+"""
+    find_input_files(; cfg::FLiPConfig=_CFG) -> Vector{String}
+
+Discover input point cloud files from the configured `pipeline_input_path`.
+
+If `pipeline_input_path` points to a single file, returns `[input_path]`.
+If it points to a directory, returns all files matching
+`{input_prefix}*.{input_format}` sorted alphabetically. Errors when the
+directory exists but contains no matching files.
+"""
+function find_input_files(; cfg::FLiPConfig=_CFG)
+    input_path = cfg.pipeline_input_path
+    prefix = cfg.pipeline_input_prefix
+    fmt = lowercase(cfg.pipeline_input_format)
+
+    # Single file mode
+    if isfile(input_path)
+        return [input_path]
+    end
+
+    # Directory mode
+    isdir(input_path) || error("input_path is not a file or directory: $input_path")
+    ext = "." * fmt
+    files = sort(filter(readdir(input_path; join=true)) do f
+        bn = basename(f)
+        startswith(bn, prefix) && endswith(lowercase(bn), ext)
+    end)
+    isempty(files) && error("No .$(fmt) files matching prefix '$(prefix)' found in: $input_path")
+    return files
+end
 
 """
     get_output_path(dir, prefix, stem, fmt) -> String

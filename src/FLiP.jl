@@ -16,11 +16,11 @@ using FLiP
 # Load point cloud
 pc = read_las("input.laz")
 
-# Subsample using minimum distance
-pc_sub = distance_subsample(pc, 0.05)
+# Subsample using minimum distance (filters return indices; subset explicitly)
+pc_sub = pc[distance_subsample(coordinates(pc), 0.05)]
 
 # Remove statistical outliers
-pc_clean = statistical_filter(pc_sub, k_neighbors=10, n_sigma=2.0)
+pc_clean = pc_sub[statistical_filter(coordinates(pc_sub), 10, 2.0)]
 
 # Apply transformation
 pc_transformed = translate(pc_clean, 100.0, 200.0, 0.0)
@@ -47,10 +47,11 @@ using Rotations
 
 # Include submodules
 include("pointcloud.jl")
-include("io.jl")
 include("config.jl")
-include("subsampling.jl")
-include("filtering.jl")
+include("io.jl")
+include("util/array_utils.jl")
+include("util/geometry_utils.jl")
+include("util/pointcloud_utils.jl")
 include("preprocess.jl")
 include("ground_segmentation.jl")
 include("mesh.jl")
@@ -77,18 +78,18 @@ export PointCloudMetadata
 export read_las_metadata, read_laz_metadata, read_e57_metadata, read_pc_metadata
 
 # Export subsampling functions
-export distance_subsample, distance_subsample_indices
+export distance_subsample
 
 # Export config
 export FLiPConfig, load_config!, coord_type
 
 # Export filtering functions
-export statistical_filter, statistical_filter_indices
-export grid_zmin_filter_indices, upward_conic_filter_indices
-export voxel_connected_component_filter_indices
-export rnn_filter, rnn_filter_indices
+export statistical_filter
+export grid_zmin_filter, upward_conic_filter
+export voxel_connected_component_filter
+export rnn_filter
 export segment_ground
-export XY_polygon_filter_indices, XY_polygon_filter
+export XY_polygon_filter
 export convex_hull_2d, buffer_polygon, polygon_area
 export crop_by_ground_polygon
 export ground_segmentation
@@ -117,7 +118,7 @@ export create_skeleton_cloud
 export assemble_segments
 
 # Export pipeline functions
-export preprocess, discover_input_files
+export preprocess, find_input_files
 export calculate_aboveground_height
 export qsm
 export generate_report

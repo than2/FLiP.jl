@@ -14,10 +14,10 @@ function segment_ground(pc::PointCloud;
                         min_cc_size::Int=_CFG.segment_ground_min_cc_size)
     coords = coordinates(pc)
 
-    idx1 = voxel_connected_component_filter_indices(coords, voxel_size, min_cc_size=min_cc_size)
-    idx2_local = grid_zmin_filter_indices(coords[idx1, :], grid_size)
+    idx1 = voxel_connected_component_filter(coords, voxel_size, min_cc_size=min_cc_size)
+    idx2_local = grid_zmin_filter(coords[idx1, :], grid_size)
     idx2 = idx1[idx2_local]
-    idx3_local = upward_conic_filter_indices(coords[idx2, :], cone_theta_deg)
+    idx3_local = upward_conic_filter(coords[idx2, :], cone_theta_deg)
     idx_final = idx2[idx3_local]
     return pc[idx_final]
 end
@@ -171,7 +171,7 @@ end
 
 Crop a point cloud to the buffered 2D convex hull of ground points.
 
-First applies `statistical_filter` to the ground points to remove outliers,
+First applies `statistical_filter` (in index form) to the ground points to remove outliers,
 then computes the convex hull in the XY plane, expands it by `buffer` meters,
 and returns only the points inside the buffered polygon.
 
@@ -192,7 +192,7 @@ function crop_by_ground_polygon(pc::PointCloud, ground_points::PointCloud;
                                 k_neighbors::Int=_CFG.statistical_filter_k_neighbors,
                                 n_sigma::Real=_CFG.statistical_filter_n_sigma)
     # Clean ground points before computing hull
-    gnd_clean = statistical_filter(ground_points, k_neighbors, n_sigma)
+    gnd_clean = ground_points[statistical_filter(coordinates(ground_points), k_neighbors, n_sigma)]
     if npoints(gnd_clean) < 3
         return (pc_cropped=pc, ground_area=0.0)
     end
@@ -203,7 +203,7 @@ function crop_by_ground_polygon(pc::PointCloud, ground_points::PointCloud;
     area = polygon_area(hull_buffered)
 
     # Crop
-    pc_cropped = XY_polygon_filter(pc, hull_buffered)
+    pc_cropped = pc[XY_polygon_filter(coordinates(pc), hull_buffered)]
     return (pc_cropped=pc_cropped, ground_area=area)
 end
 

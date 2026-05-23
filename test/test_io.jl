@@ -38,7 +38,7 @@
         @testset "Subsample and save" begin
             coords = rand(Float64, 500, 3)
             pc = make_test_pointcloud(coords)
-            pc_sub = distance_subsample(pc, 0.1)
+            pc_sub = pc[distance_subsample(coordinates(pc), 0.1)]
             @test length(pc_sub) <= length(pc)
 
             output_path = joinpath(test_dir, "test_subsampled.las")
