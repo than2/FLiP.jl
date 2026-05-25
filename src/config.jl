@@ -47,6 +47,7 @@ mutable struct FLiPConfig
     tree_linearity_angle_deg::Float64
     tree_assembly_merge_threshold::Float64
     tree_assembly_occlusion_tolerance::Float64
+    tree_resolve_isolated_branches::Bool
 
     # qsm
     qsm_nbs_linearity_threshold::Float64
@@ -119,6 +120,7 @@ function FLiPConfig(d::Dict)
         Float64(get(ts, "linearity_angle_deg", 80.0)),
         Float64(get(ts, "assembly_merge_threshold", 0.5)),
         Float64(get(ts, "assembly_occlusion_tolerance", 0.1)),
+        Bool(get(ts, "resolve_isolated_branches", false)),
 
         Float64(get(qm, "nbs_linearity_threshold", 0.5)),
         Float64(get(qm, "slice_height_scalar", 3.0)),

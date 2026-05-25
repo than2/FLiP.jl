@@ -46,6 +46,7 @@ min_nbs_size = 5               # Minimum points per NBS segment (also min CC siz
 linearity_angle_deg = 80.0  # Max angular deviation (degrees) for NBS expansion direction filtering
 assembly_merge_threshold = 0.5  # Fraction of nodes connected to tree NBS required to merge (0.0–1.0)
 assembly_occlusion_tolerance = 0.1  # Max distance (m) to search for nearby assigned points when rescuing orphan NBS
+resolve_isolated_branches = false   # If true, for any connected component where no near-ground NBS was found, seed the single largest NBS as a fresh tree and run iterative growth from it (rescues ground-disconnected branch clusters before orphan rescue)
 
 [qsm]
 nbs_linearity_threshold = 0.5   # Minimum linearity (λ₃-λ₂)/λ₃ for an NBS to be processed by QSM

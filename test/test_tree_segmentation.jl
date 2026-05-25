@@ -75,6 +75,161 @@
         @test info.nbs_adj[1, 1] == 0     # intra-NBS edges not stored
     end
 
+    @testset "_seed_largest_nbs!" begin
+        # Three NBS, the second is largest by point count.
+        nbs_points   = [Int[1, 2, 3], Int[4, 5, 6, 7, 8], Int[]]
+        assigned_nbs = falses(3)
+        nbs_tree     = zeros(Int32, 3)
+        tree_id      = zeros(Int32, 8)
+
+        tid = FLiP._seed_largest_nbs!(tree_id, nbs_tree, assigned_nbs,
+                                      nbs_points, Int32(1))
+
+        @test tid == Int32(1)
+        @test nbs_tree == Int32[0, 1, 0]
+        @test assigned_nbs == BitVector([false, true, false])
+        @test tree_id[1:3] == zeros(Int32, 3)         # NBS 1 untouched
+        @test tree_id[4:8] == ones(Int32, 5)          # NBS 2 seeded as tree 1
+
+        # Ties pick the first NBS at the max count (strict > in argmax)
+        nbs_points2   = [Int[1, 2], Int[3, 4]]
+        assigned_nbs2 = falses(2)
+        nbs_tree2     = zeros(Int32, 2)
+        tree_id2      = zeros(Int32, 4)
+        @test FLiP._seed_largest_nbs!(tree_id2, nbs_tree2, assigned_nbs2,
+                                      nbs_points2, Int32(7)) == Int32(7)
+        @test nbs_tree2 == Int32[7, 0]
+        @test tree_id2  == Int32[7, 7, 0, 0]
+
+        # All-empty NBS slot list returns 0 and leaves everything untouched
+        nbs_points3   = [Int[], Int[]]
+        assigned_nbs3 = falses(2)
+        nbs_tree3     = zeros(Int32, 2)
+        tree_id3      = zeros(Int32, 0)
+        @test FLiP._seed_largest_nbs!(tree_id3, nbs_tree3, assigned_nbs3,
+                                      nbs_points3, Int32(3)) == Int32(0)
+        @test !any(assigned_nbs3)
+        @test all(==(Int32(0)), nbs_tree3)
+    end
+
+    # Shared fixture: a 3-NBS linear chain. Each NBS has 2 skeleton nodes so
+    # `frac_connected` can land on the Rule-A side of the merge threshold.
+    #
+    # NBS 1: pts 1-4  → nodes 1,1,2,2 → skel verts 1,2
+    # NBS 2: pts 5-8  → nodes 3,3,4,4 → skel verts 3,4
+    # NBS 3: pts 9-12 → nodes 5,5,6,6 → skel verts 5,6
+    #
+    # Point-graph edges: intra-node + intra-NBS (between the two nodes) +
+    # one cross-NBS edge each at the NBS boundary.
+    # Skeleton edges: 1-2, 3-4, 5-6 (intra-NBS) and 2-3, 4-5 (NBS boundaries).
+    function _make_chain_fixture()
+        nbs_id  = Int[1,1,1,1, 2,2,2,2, 3,3,3,3]
+        node_id = Int[1,1,2,2, 3,3,4,4, 5,5,6,6]
+
+        graph = Graphs.SimpleGraph(12)
+        # Intra-node edges
+        for (u, v) in [(1,2), (3,4), (5,6), (7,8), (9,10), (11,12)]
+            Graphs.add_edge!(graph, u, v)
+        end
+        # Intra-NBS, cross-node edges (so the two nodes of each NBS are linked)
+        for (u, v) in [(2,3), (6,7), (10,11)]
+            Graphs.add_edge!(graph, u, v)
+        end
+        # Cross-NBS boundary edges
+        Graphs.add_edge!(graph, 4, 5)   # NBS 1 ↔ NBS 2
+        Graphs.add_edge!(graph, 8, 9)   # NBS 2 ↔ NBS 3
+
+        # 6 skeleton vertices, one per node
+        graph_skeleton = Graphs.SimpleGraph(6)
+        for (u, v) in [(1,2), (3,4), (5,6), (2,3), (4,5)]
+            Graphs.add_edge!(graph_skeleton, u, v)
+        end
+        skel_coords = Float64[
+            0.0 0.0 0.0;
+            1.0 0.0 0.0;
+            2.0 0.0 0.0;
+            3.0 0.0 0.0;
+            4.0 0.0 0.0;
+            5.0 0.0 0.0;
+        ]
+        skel_pc = FLiP.PointCloud(skel_coords, Dict{Symbol,Vector}())
+        FLiP.setattribute!(skel_pc, :node_id,  Int32[1, 2, 3, 4, 5, 6])
+        FLiP.setattribute!(skel_pc, :n_points, Int32[2, 2, 2, 2, 2, 2])
+
+        # Coords just need to be N×3 finite numbers; values don't influence assembly.
+        coords = hcat(collect(1.0:12.0), zeros(12), zeros(12))
+
+        return (graph=graph, coords=coords, nbs_id=nbs_id, node_id=node_id,
+                graph_skeleton=graph_skeleton, skel_pc=skel_pc)
+    end
+
+    @testset "_iterative_tree_growth!" begin
+        f = _make_chain_fixture()
+
+        K_nbs = 3
+        info  = FLiP._init_assembly_info(f.graph, f.nbs_id, f.node_id,
+                                         f.graph_skeleton, f.skel_pc, K_nbs, 6)
+
+        # Pre-seed NBS 1 as tree 1 (manual stand-in for step 4.1)
+        tree_id      = zeros(Int32, 12)
+        tree_nbs_id  = Int32.(f.nbs_id)
+        nbs_tree     = zeros(Int32, K_nbs)
+        assigned_nbs = falses(K_nbs)
+
+        nbs_tree[1]     = Int32(1)
+        assigned_nbs[1] = true
+        for i in info.nbs_points[1]
+            tree_id[i] = Int32(1)
+        end
+
+        n_iter = FLiP._iterative_tree_growth!(
+            tree_id, tree_nbs_id, nbs_tree, assigned_nbs,
+            K_nbs, info.nbs_points, info.nbs_skel_nodes, info.skel_to_nbs,
+            info.nbs_adj, f.graph_skeleton, 0.5,
+        )
+
+        @test n_iter >= 1
+        @test all(assigned_nbs)                        # every NBS got a tree
+        @test all(nbs_tree .== Int32(1))               # propagated from NBS 1
+        @test all(tree_id  .== Int32(1))               # every point assigned
+    end
+
+    @testset "resolve_isolated_branches via assemble_segments" begin
+        f = _make_chain_fixture()
+
+        # CC-B: no near-ground NBS. Even the lowest AGH is above the ceiling
+        # (default threshold 0.3 + 2 * subsample_res 0.05 = 0.4).
+        agh_no_ground = fill(1.0, 12)
+
+        cfg_off = FLiP.FLiPConfig(Dict{String,Any}())
+        cfg_off.tree_resolve_isolated_branches = false
+        res_off = FLiP.assemble_segments(f.graph, f.coords, f.nbs_id, f.node_id,
+                                         agh_no_ground, f.graph_skeleton, f.skel_pc;
+                                         cfg=cfg_off)
+        @test all(==(Int32(0)), res_off.tree_id)       # nothing assigned without the flag
+
+        cfg_on = FLiP.FLiPConfig(Dict{String,Any}())
+        cfg_on.tree_resolve_isolated_branches = true
+        res_on = FLiP.assemble_segments(f.graph, f.coords, f.nbs_id, f.node_id,
+                                        agh_no_ground, f.graph_skeleton, f.skel_pc;
+                                        cfg=cfg_on)
+        @test all(>(Int32(0)), res_on.tree_id)         # every point now has a tree id
+        @test length(unique(res_on.tree_id)) == 1      # all merged into one tree
+
+        # CC-A regression: with a near-ground NBS, the fallback must NOT fire,
+        # so the result with the flag on equals the result with it off.
+        agh_with_ground = vcat(fill(0.1, 4), fill(1.0, 4), fill(2.0, 4))
+
+        res_gate_off = FLiP.assemble_segments(f.graph, f.coords, f.nbs_id, f.node_id,
+                                              agh_with_ground, f.graph_skeleton, f.skel_pc;
+                                              cfg=cfg_off)
+        res_gate_on  = FLiP.assemble_segments(f.graph, f.coords, f.nbs_id, f.node_id,
+                                              agh_with_ground, f.graph_skeleton, f.skel_pc;
+                                              cfg=cfg_on)
+        @test res_gate_off.tree_id == res_gate_on.tree_id
+        @test length(unique(res_gate_on.tree_id[res_gate_on.tree_id .> 0])) == 1
+    end
+
     @testset "_propagate_orphan_labels" begin
         # 3 orphan NBS:
         #  orphan 1: directly connected to tree 7 via KDTree pass

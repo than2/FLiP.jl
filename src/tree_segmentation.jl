@@ -597,123 +597,24 @@ function assemble_segments(
 
     @info "Assembly: seeded $(next_tree_id - 1) trees from near-ground NBS"
 
+    # ── Step 4.1b: optional fallback seed for ground-disconnected CCs ────
+    # If this connected component contains no near-ground NBS, the iterative
+    # growth would leave every NBS unassigned and rely on the cross-component
+    # orphan rescue. When `tree_resolve_isolated_branches` is set, we instead
+    # seed the largest NBS in the CC as a fresh tree so step 4.2 can grow
+    # through it deterministically.
+    if cfg.tree_resolve_isolated_branches && next_tree_id == Int32(1)
+        assigned_tid = _seed_largest_nbs!(tree_id, nbs_tree, assigned_nbs,
+                                          nbs_points, next_tree_id)
+        if assigned_tid > 0
+            next_tree_id += Int32(1)
+        end
+    end
+
     # ── Step 4.2: iterative growth via skeleton graph ────────────
-    # `frontier_info` is built once and maintained INCREMENTALLY: each time an NBS
-    # transitions to assigned we add its contributions to its unassigned skeleton
-    # neighbors and remove it from the frontier set. Updates from within an iteration
-    # are DEFERRED and applied after the iteration to match the original
-    # rebuild-each-iteration semantics (later k's in the same round don't see earlier
-    # k's contributions, matching the snapshot-and-process model).
-    frontier_info = Dict{Int, Dict{Int32, Int}}()   # frontier_nbs → Dict(tree_id → connection_count)
-    for k in 1:K_nbs
-        assigned_nbs[k] || continue
-        _update_frontier_after_assign!(frontier_info, k, nbs_tree[k],
-                                       nbs_skel_nodes, skel_to_nbs, assigned_nbs,
-                                       nbs_adj, graph_skeleton)
-    end
-
-    pending_assignments = Tuple{Int,Int32}[]
-    iteration = 0
-    while !isempty(frontier_info)
-        iteration += 1
-
-        # Sort frontier NBS by number of points (large → small)
-        frontier_sorted = sort!(collect(keys(frontier_info));
-                                by = k -> -length(nbs_points[k]))
-        empty!(pending_assignments)
-        n_assigned_this_round = 0
-
-        for k in frontier_sorted
-            assigned_nbs[k] && continue   # may have been assigned earlier this round
-
-            skel_nodes_k     = nbs_skel_nodes[k]
-            tree_connections = frontier_info[k]
-            n_total_nodes    = length(skel_nodes_k)
-
-            # Fused single pass over skel_nodes_k × skeleton neighbors that computes
-            # BOTH `n_nodes_with_tree_conn` (for Rule A/B branch test) and
-            # `skel_neighbor_counts` (for Rule B target selection). Was two separate
-            # passes before — same total cost regardless of which branch fires.
-            skel_neighbor_counts = Dict{Int, Int}()
-            n_nodes_with_tree_conn = 0
-            for sv in skel_nodes_k
-                has_tree_conn = false
-                for sn in Graphs.neighbors(graph_skeleton, sv)
-                    nbr_nbs = skel_to_nbs[sn]
-                    (nbr_nbs > 0 && nbr_nbs != k) || continue
-                    skel_neighbor_counts[nbr_nbs] = get(skel_neighbor_counts, nbr_nbs, 0) + 1
-                    if !has_tree_conn && assigned_nbs[nbr_nbs]
-                        n_nodes_with_tree_conn += 1
-                        has_tree_conn = true
-                    end
-                end
-            end
-
-            # Best tree = most total point-level connections
-            best_tree  = Int32(0)
-            best_count = 0
-            for (tid, cnt) in tree_connections
-                if cnt > best_count
-                    best_count = cnt
-                    best_tree  = tid
-                end
-            end
-            best_tree == 0 && continue   # shouldn't happen for a valid frontier
-
-            frac_connected = n_total_nodes > 0 ? n_nodes_with_tree_conn / n_total_nodes : 0.0
-
-            if frac_connected <= merge_threshold
-                # Rule A: mostly internal nodes → assign as a new branch of best_tree
-                nbs_tree[k]     = best_tree
-                assigned_nbs[k] = true
-                @inbounds for i in nbs_points[k]
-                    tree_id[i] = best_tree
-                end
-                push!(pending_assignments, (k, best_tree))
-                n_assigned_this_round += 1
-            else
-                # Rule B: straddles existing tree NBS → merge into the closest one
-                # by skeleton-edge count. Reuses the `skel_neighbor_counts` from the
-                # fused loop above.
-                target_nbs   = 0
-                target_count = 0
-                for (nbr_nbs, cnt) in skel_neighbor_counts
-                    if cnt > target_count
-                        target_count = cnt
-                        target_nbs   = nbr_nbs
-                    end
-                end
-
-                if target_nbs > 0
-                    target_tid = nbs_tree[target_nbs]
-                    if target_tid == Int32(-1)
-                        target_tid = Int32(0)   # target was a split NBS; treat as unassigned
-                    end
-                    @inbounds for i in nbs_points[k]
-                        tree_id[i]     = target_tid
-                        tree_nbs_id[i] = Int32(target_nbs)
-                    end
-                    nbs_tree[k]     = target_tid
-                    assigned_nbs[k] = true
-                    push!(pending_assignments, (k, target_tid))
-                    n_assigned_this_round += 1
-                end
-            end
-        end
-
-        # Defer frontier updates until iteration end so within-iteration assignments
-        # don't influence later k's in the same round (matches original rebuild-fresh
-        # behavior; only `assigned_nbs` and per-point `tree_id` update live).
-        for (k, tid) in pending_assignments
-            _update_frontier_after_assign!(frontier_info, k, tid,
-                                           nbs_skel_nodes, skel_to_nbs, assigned_nbs,
-                                           nbs_adj, graph_skeleton)
-        end
-
-        n_assigned_this_round == 0 && break
-
-        @info "Assembly iteration $iteration: assigned $n_assigned_this_round NBS" total_assigned=count(assigned_nbs)
-    end
+    iteration = _iterative_tree_growth!(tree_id, tree_nbs_id, nbs_tree, assigned_nbs,
+                                        K_nbs, nbs_points, nbs_skel_nodes, skel_to_nbs,
+                                        nbs_adj, graph_skeleton, Float64(merge_threshold))
 
     # ── Step 4.3: re-order tree_nbs_id by descending group size ──────
     # Within this assemble_segments call, every non-zero tree_nbs_id value belongs
@@ -848,6 +749,205 @@ function _seed_trees_from_nearground!(tree_id::AbstractVector{Int32},
     end
 
     return (nbs_tree=nbs_tree, assigned_nbs=assigned_nbs, next_tree_id=next_tree_id)
+end
+
+"""
+    _seed_largest_nbs!(tree_id, nbs_tree, assigned_nbs, nbs_points,
+                       next_tree_id) -> Int32
+
+Find the single largest NBS by `length(nbs_points[k])` and seed it with
+`next_tree_id`. Mutates `tree_id`, `nbs_tree`, `assigned_nbs` in place.
+Returns the assigned tree id, or `Int32(0)` if every NBS slot is empty.
+
+Intended as a fallback for `assemble_segments` when a connected component
+has no near-ground NBS — gives a ground-disconnected CC its own
+deterministic seed so step 4.2 can grow a tree through it instead of
+leaving everything for the cross-component orphan rescue to clean up.
+The caller is responsible for the "no near-ground seeds exist" gate; this
+helper does not consult `assigned_nbs` to skip already-seeded NBS because
+in its only intended call site nothing is seeded yet.
+"""
+function _seed_largest_nbs!(tree_id::AbstractVector{Int32},
+                            nbs_tree::Vector{Int32},
+                            assigned_nbs::BitVector,
+                            nbs_points::Vector{Vector{Int}},
+                            next_tree_id::Int32)
+    K_nbs  = length(nbs_points)
+    best_k = 0
+    best_n = 0
+    @inbounds for k in 1:K_nbs
+        n = length(nbs_points[k])
+        if n > best_n
+            best_n = n
+            best_k = k
+        end
+    end
+    best_k == 0 && return Int32(0)
+
+    nbs_tree[best_k]     = next_tree_id
+    assigned_nbs[best_k] = true
+    @inbounds for i in nbs_points[best_k]
+        tree_id[i] = next_tree_id
+    end
+    @info "Assembly: resolve_isolated_branches — seeded NBS $best_k ($best_n points) as tree $next_tree_id (no near-ground seed in this CC)"
+    return next_tree_id
+end
+
+"""
+    _iterative_tree_growth!(tree_id, tree_nbs_id, nbs_tree, assigned_nbs,
+                            K_nbs, nbs_points, nbs_skel_nodes, skel_to_nbs,
+                            nbs_adj, graph_skeleton, merge_threshold) -> Int
+
+Iteratively grow trees from the currently-seeded NBS outward through the
+skeleton graph. `assigned_nbs[k] == true` marks the seed set on entry; the
+function consumes it and mutates `assigned_nbs`, `nbs_tree`, per-point
+`tree_id`, and per-point `tree_nbs_id` in place. Returns the number of
+growth iterations performed.
+
+`frontier_info` (built locally) maps an unassigned NBS to the set of
+candidate `tree_id → connection_count` votes from its already-assigned
+skeleton neighbors. Within each iteration the frontier is processed largest
+NBS first; each NBS picks the highest-voted tree, then either:
+
+- **Rule A** (`frac_connected ≤ merge_threshold`) — most of the NBS's
+  skeleton nodes are internal/unassigned, so it gets attached as a new
+  branch of the winning tree; the NBS keeps its own `tree_nbs_id`.
+- **Rule B** (`frac_connected > merge_threshold`) — the NBS straddles an
+  already-assigned NBS, so it merges into that target's `tree_nbs_id` and
+  inherits its `tree_id`.
+
+Frontier updates from within an iteration are deferred and applied
+afterwards, so within one round the decisions all see the same snapshot.
+"""
+function _iterative_tree_growth!(tree_id::AbstractVector{Int32},
+                                 tree_nbs_id::AbstractVector{Int32},
+                                 nbs_tree::Vector{Int32},
+                                 assigned_nbs::BitVector,
+                                 K_nbs::Int,
+                                 nbs_points::Vector{Vector{Int}},
+                                 nbs_skel_nodes::Vector{Vector{Int}},
+                                 skel_to_nbs::Vector{Int},
+                                 nbs_adj::SparseMatrixCSC{Int,Int},
+                                 graph_skeleton::SimpleGraph{Int},
+                                 merge_threshold::Float64)
+    # `frontier_info` is built once and maintained INCREMENTALLY: each time an NBS
+    # transitions to assigned we add its contributions to its unassigned skeleton
+    # neighbors and remove it from the frontier set. Updates from within an iteration
+    # are DEFERRED and applied after the iteration to match the original
+    # rebuild-each-iteration semantics (later k's in the same round don't see earlier
+    # k's contributions, matching the snapshot-and-process model).
+    frontier_info = Dict{Int, Dict{Int32, Int}}()   # frontier_nbs → Dict(tree_id → connection_count)
+    for k in 1:K_nbs
+        assigned_nbs[k] || continue
+        _update_frontier_after_assign!(frontier_info, k, nbs_tree[k],
+                                       nbs_skel_nodes, skel_to_nbs, assigned_nbs,
+                                       nbs_adj, graph_skeleton)
+    end
+
+    pending_assignments = Tuple{Int,Int32}[]
+    iteration = 0
+    while !isempty(frontier_info)
+        iteration += 1
+
+        # Sort frontier NBS by number of points (large → small)
+        frontier_sorted = sort!(collect(keys(frontier_info));
+                                by = k -> -length(nbs_points[k]))
+        empty!(pending_assignments)
+        n_assigned_this_round = 0
+
+        for k in frontier_sorted
+            assigned_nbs[k] && continue   # may have been assigned earlier this round
+
+            skel_nodes_k     = nbs_skel_nodes[k]
+            tree_connections = frontier_info[k]
+            n_total_nodes    = length(skel_nodes_k)
+
+            # Fused single pass over skel_nodes_k × skeleton neighbors that computes
+            # BOTH `n_nodes_with_tree_conn` (for Rule A/B branch test) and
+            # `skel_neighbor_counts` (for Rule B target selection). Was two separate
+            # passes before — same total cost regardless of which branch fires.
+            skel_neighbor_counts = Dict{Int, Int}()
+            n_nodes_with_tree_conn = 0
+            for sv in skel_nodes_k
+                has_tree_conn = false
+                for sn in Graphs.neighbors(graph_skeleton, sv)
+                    nbr_nbs = skel_to_nbs[sn]
+                    (nbr_nbs > 0 && nbr_nbs != k) || continue
+                    skel_neighbor_counts[nbr_nbs] = get(skel_neighbor_counts, nbr_nbs, 0) + 1
+                    if !has_tree_conn && assigned_nbs[nbr_nbs]
+                        n_nodes_with_tree_conn += 1
+                        has_tree_conn = true
+                    end
+                end
+            end
+
+            # Best tree = most total point-level connections
+            best_tree  = Int32(0)
+            best_count = 0
+            for (tid, cnt) in tree_connections
+                if cnt > best_count
+                    best_count = cnt
+                    best_tree  = tid
+                end
+            end
+            best_tree == 0 && continue   # shouldn't happen for a valid frontier
+
+            frac_connected = n_total_nodes > 0 ? n_nodes_with_tree_conn / n_total_nodes : 0.0
+
+            if frac_connected <= merge_threshold
+                # Rule A: mostly internal nodes → assign as a new branch of best_tree
+                nbs_tree[k]     = best_tree
+                assigned_nbs[k] = true
+                @inbounds for i in nbs_points[k]
+                    tree_id[i] = best_tree
+                end
+                push!(pending_assignments, (k, best_tree))
+                n_assigned_this_round += 1
+            else
+                # Rule B: straddles existing tree NBS → merge into the closest one
+                # by skeleton-edge count. Reuses the `skel_neighbor_counts` from the
+                # fused loop above.
+                target_nbs   = 0
+                target_count = 0
+                for (nbr_nbs, cnt) in skel_neighbor_counts
+                    if cnt > target_count
+                        target_count = cnt
+                        target_nbs   = nbr_nbs
+                    end
+                end
+
+                if target_nbs > 0
+                    target_tid = nbs_tree[target_nbs]
+                    if target_tid == Int32(-1)
+                        target_tid = Int32(0)   # target was a split NBS; treat as unassigned
+                    end
+                    @inbounds for i in nbs_points[k]
+                        tree_id[i]     = target_tid
+                        tree_nbs_id[i] = Int32(target_nbs)
+                    end
+                    nbs_tree[k]     = target_tid
+                    assigned_nbs[k] = true
+                    push!(pending_assignments, (k, target_tid))
+                    n_assigned_this_round += 1
+                end
+            end
+        end
+
+        # Defer frontier updates until iteration end so within-iteration assignments
+        # don't influence later k's in the same round (matches original rebuild-fresh
+        # behavior; only `assigned_nbs` and per-point `tree_id` update live).
+        for (k, tid) in pending_assignments
+            _update_frontier_after_assign!(frontier_info, k, tid,
+                                           nbs_skel_nodes, skel_to_nbs, assigned_nbs,
+                                           nbs_adj, graph_skeleton)
+        end
+
+        n_assigned_this_round == 0 && break
+
+        @info "Assembly iteration $iteration: assigned $n_assigned_this_round NBS" total_assigned=count(assigned_nbs)
+    end
+
+    return iteration
 end
 
 """
