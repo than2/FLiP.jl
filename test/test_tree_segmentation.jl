@@ -262,4 +262,56 @@
         @test FLiP._propagate_orphan_labels(Dict{Int,Int}[], Dict{Int32,Int}[],
                                             Vector{Int}[]) == Int32[]
     end
+
+    @testset "process_orphan_segments merge_threshold" begin
+        # Pre-assigned tree 1: 4 points along the z-axis at x=y=0, NBS 1, node 1.
+        # Orphan NBS 2 has 4 points spanning 2 distinct node_ids:
+        #   node 2 (close, within occlusion_tol of tree):  pts 5,6
+        #   node 3 (far from any assigned pt):              pts 7,8
+        # Node-based frac_connected = 1 connected node of 2 total = 0.5.
+        coords = Float64[
+            0.00 0.0 0.0;
+            0.00 0.0 1.0;
+            0.00 0.0 2.0;
+            0.00 0.0 3.0;
+            0.05 0.0 0.0;
+            0.05 0.0 1.0;
+            10.0 0.0 0.0;
+            10.0 0.0 1.0;
+        ]
+        nbs_id  = Int32[1, 1, 1, 1, 2, 2, 2, 2]
+        node_id = Int32[1, 1, 1, 1, 2, 2, 3, 3]
+
+        _initial_state() = (
+            tree_id     = Int32[1, 1, 1, 1, 0, 0, 0, 0],
+            tree_nbs_id = Int32[1, 1, 1, 1, 0, 0, 0, 0],
+        )
+
+        # Rule B: frac=0.5 > 0.0 → orphan merges into existing tree_nbs_id 1.
+        cfg_b = FLiP.FLiPConfig(Dict{String,Any}())
+        cfg_b.tree_assembly_merge_threshold = 0.0
+        s_b = _initial_state()
+        FLiP.process_orphan_segments(coords, nbs_id, node_id,
+                                     s_b.tree_id, s_b.tree_nbs_id; cfg=cfg_b)
+        @test s_b.tree_id[5:8]     == Int32[1, 1, 1, 1]   # orphan joins tree 1
+        @test s_b.tree_nbs_id[5:8] == Int32[1, 1, 1, 1]   # merged into existing tnid
+
+        # Rule A: frac=0.5 ≤ 0.5 → orphan keeps tree 1 but gets a fresh tnid (> 1).
+        cfg_a = FLiP.FLiPConfig(Dict{String,Any}())
+        cfg_a.tree_assembly_merge_threshold = 0.5
+        s_a = _initial_state()
+        FLiP.process_orphan_segments(coords, nbs_id, node_id,
+                                     s_a.tree_id, s_a.tree_nbs_id; cfg=cfg_a)
+        @test s_a.tree_id[5:8]                == Int32[1, 1, 1, 1]   # same tree_id
+        @test all(>(Int32(1)), s_a.tree_nbs_id[5:8])                 # not merged into tnid 1
+        @test length(unique(s_a.tree_nbs_id[5:8])) == 1              # all share one fresh tnid
+
+        # merge_threshold = 1.0 fully suppresses orphan→tnid merging.
+        cfg_strict = FLiP.FLiPConfig(Dict{String,Any}())
+        cfg_strict.tree_assembly_merge_threshold = 1.0
+        s_strict = _initial_state()
+        FLiP.process_orphan_segments(coords, nbs_id, node_id,
+                                     s_strict.tree_id, s_strict.tree_nbs_id; cfg=cfg_strict)
+        @test all(>(Int32(1)), s_strict.tree_nbs_id[5:8])
+    end
 end

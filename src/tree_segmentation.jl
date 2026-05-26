@@ -176,7 +176,7 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     empty!(all_skel_coords); empty!(all_skel_attrs); empty!(all_skel_edges)
 
     # ── Step 5: cross-component orphan-NBS rescue ─────────────────
-    process_orphan_segments(coords_filtered, global_nbs_id,
+    process_orphan_segments(coords_filtered, global_nbs_id, global_node_id,
                             global_tree_id, global_tree_nbs_id; cfg=cfg)
 
     # ── Step 6: reorder tree_id by descending point count ─────────
@@ -794,6 +794,42 @@ function _seed_largest_nbs!(tree_id::AbstractVector{Int32},
 end
 
 """
+    _check_merge_and_update_nbs!(point_idxs, tree_id, tree_nbs_id,
+                                 frac, merge_threshold,
+                                 tid_if_branch, tnid_if_branch,
+                                 tid_if_merge,  tnid_if_merge) -> Symbol
+
+Apply the Rule A / Rule B merge decision to every index in `point_idxs`.
+
+- **Rule B** fires when `frac > merge_threshold` AND `tnid_if_merge > 0`:
+  `tree_id[i] = tid_if_merge`, `tree_nbs_id[i] = tnid_if_merge` for each point.
+- **Rule A** otherwise (frac below threshold OR no valid merge target):
+  `tree_id[i] = tid_if_branch`, `tree_nbs_id[i] = tnid_if_branch` — the NBS is
+  preserved as its own branch.
+
+Returns `:rule_a` or `:rule_b`. Shared by `_iterative_tree_growth!` and
+`process_orphan_segments` so the merge rule has a single implementation.
+"""
+@inline function _check_merge_and_update_nbs!(
+    point_idxs::AbstractVector{Int},
+    tree_id::AbstractVector{Int32},
+    tree_nbs_id::AbstractVector{Int32},
+    frac::Float64,
+    merge_threshold::Float64,
+    tid_if_branch::Int32, tnid_if_branch::Int32,
+    tid_if_merge::Int32,  tnid_if_merge::Int32,
+)
+    is_merge = (frac > merge_threshold) && (tnid_if_merge > 0)
+    out_tid  = is_merge ? tid_if_merge  : tid_if_branch
+    out_tnid = is_merge ? tnid_if_merge : tnid_if_branch
+    @inbounds for i in point_idxs
+        tree_id[i]     = out_tid
+        tree_nbs_id[i] = out_tnid
+    end
+    return is_merge ? :rule_b : :rule_a
+end
+
+"""
     _iterative_tree_growth!(tree_id, tree_nbs_id, nbs_tree, assigned_nbs,
                             K_nbs, nbs_points, nbs_skel_nodes, skel_to_nbs,
                             nbs_adj, graph_skeleton, merge_threshold) -> Int
@@ -807,7 +843,9 @@ growth iterations performed.
 `frontier_info` (built locally) maps an unassigned NBS to the set of
 candidate `tree_id → connection_count` votes from its already-assigned
 skeleton neighbors. Within each iteration the frontier is processed largest
-NBS first; each NBS picks the highest-voted tree, then either:
+NBS first; each NBS picks the highest-voted tree, then dispatches to
+[`_check_merge_and_update_nbs!`](@ref) which encodes the shared Rule A /
+Rule B decision:
 
 - **Rule A** (`frac_connected ≤ merge_threshold`) — most of the NBS's
   skeleton nodes are internal/unassigned, so it gets attached as a new
@@ -894,42 +932,39 @@ function _iterative_tree_growth!(tree_id::AbstractVector{Int32},
 
             frac_connected = n_total_nodes > 0 ? n_nodes_with_tree_conn / n_total_nodes : 0.0
 
-            if frac_connected <= merge_threshold
-                # Rule A: mostly internal nodes → assign as a new branch of best_tree
+            # Rule B target: NBS with the highest skeleton-edge count (reuses the
+            # `skel_neighbor_counts` from the fused loop above). `target_tnid == 0`
+            # means no candidate exists, and the helper falls back to Rule A.
+            target_nbs   = 0
+            target_count = 0
+            for (nbr_nbs, cnt) in skel_neighbor_counts
+                if cnt > target_count
+                    target_count = cnt
+                    target_nbs   = nbr_nbs
+                end
+            end
+            target_tid_raw = target_nbs > 0 ? nbs_tree[target_nbs] : Int32(0)
+            # Split-NBS edge case: target marked -1 → treat as unassigned tree
+            target_tid     = target_tid_raw == Int32(-1) ? Int32(0) : target_tid_raw
+            target_tnid    = Int32(target_nbs)
+
+            rule = _check_merge_and_update_nbs!(
+                nbs_points[k], tree_id, tree_nbs_id,
+                frac_connected, merge_threshold,
+                best_tree,  Int32(k),       # Rule A: new branch under best_tree, keep own NBS id
+                target_tid, target_tnid,    # Rule B: merge into target NBS within its tree
+            )
+
+            if rule === :rule_a
                 nbs_tree[k]     = best_tree
                 assigned_nbs[k] = true
-                @inbounds for i in nbs_points[k]
-                    tree_id[i] = best_tree
-                end
                 push!(pending_assignments, (k, best_tree))
                 n_assigned_this_round += 1
-            else
-                # Rule B: straddles existing tree NBS → merge into the closest one
-                # by skeleton-edge count. Reuses the `skel_neighbor_counts` from the
-                # fused loop above.
-                target_nbs   = 0
-                target_count = 0
-                for (nbr_nbs, cnt) in skel_neighbor_counts
-                    if cnt > target_count
-                        target_count = cnt
-                        target_nbs   = nbr_nbs
-                    end
-                end
-
-                if target_nbs > 0
-                    target_tid = nbs_tree[target_nbs]
-                    if target_tid == Int32(-1)
-                        target_tid = Int32(0)   # target was a split NBS; treat as unassigned
-                    end
-                    @inbounds for i in nbs_points[k]
-                        tree_id[i]     = target_tid
-                        tree_nbs_id[i] = Int32(target_nbs)
-                    end
-                    nbs_tree[k]     = target_tid
-                    assigned_nbs[k] = true
-                    push!(pending_assignments, (k, target_tid))
-                    n_assigned_this_round += 1
-                end
+            elseif target_tnid > 0
+                nbs_tree[k]     = target_tid
+                assigned_nbs[k] = true
+                push!(pending_assignments, (k, target_tid))
+                n_assigned_this_round += 1
             end
         end
 
@@ -985,7 +1020,7 @@ end
 # ── Step 5: orphan NBS rescue ─────────────────────────────────────
 
 """
-    process_orphan_segments(coords, nbs_id, tree_id, tree_nbs_id; cfg) -> nothing
+    process_orphan_segments(coords, nbs_id, node_id, tree_id, tree_nbs_id; cfg) -> nothing
 
 Rescue orphan NBS that the per-component assembly never assigned to a tree.
 Builds a coarse NBS-level graph from two sources:
@@ -994,18 +1029,31 @@ Builds a coarse NBS-level graph from two sources:
   2. KDTree search from orphan points to already-assigned points
      — orphan↔tree edges
 
-then iteratively propagates `tree_id` through the coarse graph. Mutates
-`tree_id` and `tree_nbs_id` in place.
+then iteratively propagates `tree_id` through the coarse graph. The `tree_nbs_id`
+assignment for each rescued orphan is gated by the same Rule A / Rule B logic
+as `_iterative_tree_growth!`, using a node-based `frac_connected =
+n_orphan_nodes_with_tree_conn / n_orphan_nodes_total`. When `frac >
+cfg.tree_assembly_merge_threshold` AND a candidate `tree_nbs_id` exists, the
+orphan merges into that existing tnid (Rule B). Otherwise it inherits only the
+winning `tree_id` and is given a fresh `tree_nbs_id` (Rule A), preserving the
+orphan as its own NBS. Mutates `tree_id` and `tree_nbs_id` in place.
+
+`node_id` is the per-point, globally-unique NBS-node label produced by
+[`label_non_branching_segments`](@ref) (offset across components by
+`tree_segmentation`); it provides the same structural granularity as the
+intra-component skeleton graph without requiring a cross-component skeleton.
 """
 function process_orphan_segments(
     coords::AbstractMatrix{<:Real},
     nbs_id::AbstractVector{<:Integer},
+    node_id::AbstractVector{<:Integer},
     tree_id::AbstractVector{Int32},
     tree_nbs_id::AbstractVector{Int32};
     cfg::FLiPConfig = _CFG,
 )
     N = size(coords, 1)
-    occlusion_tol = cfg.tree_assembly_occlusion_tolerance
+    occlusion_tol   = cfg.tree_assembly_occlusion_tolerance
+    merge_threshold = Float64(cfg.tree_assembly_merge_threshold)
     occlusion_tol > 0 || return nothing
 
     K_nbs_global = Int(maximum(nbs_id; init=0))
@@ -1043,6 +1091,20 @@ function process_orphan_segments(
     orphan_idx_of_nbs = zeros(Int, K_nbs_global)
     @inbounds for (idx, nid) in enumerate(orphan_nbs_ids)
         orphan_idx_of_nbs[nid] = idx
+    end
+
+    # Per-orphan distinct-node sets — drive the same node-based `frac_connected`
+    # metric that `_iterative_tree_growth!` uses. `orphan_all_nodes[i]` is the
+    # full set of node_ids the orphan NBS owns; `orphan_conn_nodes[i]` is the
+    # subset whose points have at least one tree-connected KDTree hit (filled
+    # during the KDTree loop below). node_id is globally unique post-component
+    # offsetting so Set membership is safe.
+    orphan_all_nodes  = [Set{Int}() for _ in 1:K_orphan]
+    orphan_conn_nodes = [Set{Int}() for _ in 1:K_orphan]
+    @inbounds for orph_idx in 1:K_orphan
+        for i in orphan_nbs_points[orph_idx]
+            push!(orphan_all_nodes[orph_idx], Int(node_id[i]))
+        end
     end
 
     # Pre-sized orphan point index vector
@@ -1101,23 +1163,30 @@ function process_orphan_segments(
         kdtree = KDTree(assigned_3xM)
         @info "[tree_segmentation] orphan rescue: KDTree query for orphan→tree connections"
 
-        # Single pass populates both coarse_o2t and orphan_to_tree_nbs_v.
+        # Single pass populates coarse_o2t, orphan_to_tree_nbs_v, and the
+        # `orphan_conn_nodes` set used by the node-based frac_connected metric.
         @inbounds for orph_idx in 1:K_orphan
-            orph_pts = orphan_nbs_points[orph_idx]
-            o2t = coarse_o2t[orph_idx]
-            o2tn = orphan_to_tree_nbs_v[orph_idx]
+            orph_pts  = orphan_nbs_points[orph_idx]
+            o2t       = coarse_o2t[orph_idx]
+            o2tn      = orphan_to_tree_nbs_v[orph_idx]
+            conn_nset = orphan_conn_nodes[orph_idx]
             for i in orph_pts
                 query = SVector{3, Float64}(coords[i, 1], coords[i, 2], coords[i, 3])
                 hits = inrange(kdtree, query, occlusion_tol)
+                point_has_tree_conn = false
                 for j in hits
                     aid  = assigned_idx[j]
                     tid  = tree_id[aid]
                     tnid = tree_nbs_id[aid]
                     tid > 0 || continue
+                    point_has_tree_conn = true
                     o2t[tid] = get(o2t, tid, 0) + 1
                     tnid > 0 || continue
                     key = (tid, tnid)
                     o2tn[key] = get(o2tn, key, 0) + 1
+                end
+                if point_has_tree_conn
+                    push!(conn_nset, Int(node_id[i]))
                 end
             end
         end
@@ -1138,15 +1207,20 @@ function process_orphan_segments(
     orphan_tree_id = _propagate_orphan_labels(coarse_o2o, coarse_o2t, orphan_nbs_points)
 
     # ── Apply orphan assignments ─────────────────────────────────
-    # `next_fresh_tnbs` allocates globally-unique labels for orphans whose `best_tid`
-    # has no nearby NBS (rescued purely via orphan→orphan propagation).
+    # `next_fresh_tnbs` allocates globally-unique labels for orphans that take
+    # the Rule-A path (no merge): either no nearby NBS exists (rescued purely
+    # via orphan→orphan propagation) or the node-based `frac_connected` is at
+    # or below `merge_threshold`. Tnid is consumed only when Rule A actually
+    # fires; the helper signals which rule was applied.
     next_fresh_tnbs = Int32(maximum(tree_nbs_id; init = Int32(0))) + Int32(1)
+    n_rule_a = 0
+    n_rule_b = 0
 
     for orph_idx in 1:K_orphan
         best_tid = orphan_tree_id[orph_idx]
         best_tid > 0 || continue
 
-        # Best tnid within best_tid (filter the flattened (tid, tnid) → count dict)
+        # Best existing tnid within best_tid (filter the flattened (tid, tnid) → count dict)
         best_tnbs     = Int32(0)
         best_tnbs_cnt = 0
         for ((tid, tnid), cnt) in orphan_to_tree_nbs_v[orph_idx]
@@ -1157,16 +1231,27 @@ function process_orphan_segments(
             end
         end
 
-        if best_tnbs == 0
-            best_tnbs = next_fresh_tnbs
-            next_fresh_tnbs += Int32(1)
-        end
+        # Node-based frac_connected (same semantics as _iterative_tree_growth!)
+        n_total = length(orphan_all_nodes[orph_idx])
+        n_conn  = length(orphan_conn_nodes[orph_idx])
+        frac    = n_total > 0 ? n_conn / n_total : 0.0
 
-        @inbounds for i in orphan_nbs_points[orph_idx]
-            tree_id[i]     = best_tid
-            tree_nbs_id[i] = best_tnbs
+        # Tentative fresh tnid for Rule A; only consumed if helper actually fires Rule A
+        branch_tnid = next_fresh_tnbs
+        rule = _check_merge_and_update_nbs!(
+            orphan_nbs_points[orph_idx], tree_id, tree_nbs_id,
+            frac, merge_threshold,
+            best_tid, branch_tnid,    # Rule A: new branch
+            best_tid, best_tnbs,      # Rule B: merge target (best_tnbs == 0 ⇒ helper falls back to Rule A)
+        )
+        if rule === :rule_a
+            next_fresh_tnbs += Int32(1)
+            n_rule_a += 1
+        else
+            n_rule_b += 1
         end
     end
+    @info "[tree_segmentation] orphan rescue apply: Rule A=$n_rule_a (new tnid), Rule B=$n_rule_b (merged tnid), threshold=$merge_threshold"
 
     return nothing
 end
