@@ -20,6 +20,7 @@ end
     include("test_io.jl")
     include("test_subsampling.jl")
     include("test_filtering.jl")
+    include("test_geometry.jl")
     include("test_interpolation.jl")
     include("test_mesh.jl")
     include("test_graph.jl")

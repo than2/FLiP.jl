@@ -263,9 +263,14 @@
     end
 
     @testset "crop_by_ground_polygon" begin
-        # Ground points in a small square region
+        # Ground points on a deterministic 14×15 grid inside [0.5, 9.5]²;
+        # take the first 200. Convex hull is the bounding rectangle, buffer=2
+        # expands it well past every interior grid point — robust assertion
+        # without the RNG-induced edge cases the random fixture had.
         n_gnd = 200
-        gnd_coords = hcat(rand(n_gnd) .* 10.0, rand(n_gnd) .* 10.0, zeros(n_gnd))
+        xs = repeat(range(0.5, 9.5; length=14), inner=15)
+        ys = repeat(range(0.5, 9.5; length=15), outer=14)
+        gnd_coords = hcat(xs[1:n_gnd], ys[1:n_gnd], zeros(n_gnd))
         ground = make_test_pointcloud(gnd_coords)
 
         # Full cloud: ground region + far-away outlier points

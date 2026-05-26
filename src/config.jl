@@ -61,8 +61,8 @@ mutable struct FLiPConfig
     qsm_spl_z_smoothing::Float64
     qsm_rho_percentile::Float64
     qsm_min_octant_taubin::Int
-    qsm_terminal_completeness_threshold::Float64
-    qsm_terminal_rho_percentile::Float64
+    qsm_qc_enable::Bool
+    qsm_qc_continuity_ratio::Float64
 
     # coordinate precision
     coordinate_precision::DataType
@@ -134,9 +134,8 @@ function FLiPConfig(d::Dict)
         Float64(get(qm, "spl_z_smoothing", 0.3)),
         Float64(get(qm, "rho_percentile", 1.0)),
         Int(get(qm, "min_octant_taubin", 3)),
-        Float64(get(qm, "terminal_completeness_threshold",
-                        get(qm, "completeness_threshold", 0.25))),
-        Float64(get(qm, "terminal_rho_percentile", 1.0)),
+        Bool(get(qm, "qc_enable", true)),
+        Float64(get(qm, "qc_continuity_ratio", 0.7)),
 
         let prec_str = lowercase(get(pl, "coordinate_precision", "Float32"))
             prec_str == "float64" ? Float64 : Float32

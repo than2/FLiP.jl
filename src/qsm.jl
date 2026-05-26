@@ -21,6 +21,9 @@ const OCTANT_WIDTH = π / 4
 # Generalized-eigenvalue positivity tolerance in taubin_circle_fit
 const TAUBIN_EIG_TOL = 1e-12
 
+# CC radius (in units of pipeline_subsample_res) for per-slice QC connected-component pass
+const QC_CC_RADIUS_SCALAR = 2.0
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Data structures
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -54,9 +57,6 @@ mutable struct QSMNode
     circumference::Float64
     radius_area::Float64
     radius_circ::Float64
-    rho_mean::Float64
-    rho_std::Float64
-    rho_cv::Float64
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -113,12 +113,12 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     tree_nbs_ids = hasattribute(pc, :tree_nbs_id) ? getattribute(pc, :tree_nbs_id) : zeros(Int32, N)
     agh_values = hasattribute(pc, :AGH) ? getattribute(pc, :AGH) : zeros(Float64, N)
 
-    println("[qsm] Processing $(N) points")
+    @info "[qsm] processing point cloud" n_points=N
 
     # Stage 1: Filter linear NBS segments
     linear_nbs = _filter_linear_nbs(coords, tree_nbs_ids, cfg)
     n_linear = count(!isnothing, linear_nbs)
-    println("[qsm] Found $n_linear linear NBS segments (threshold=$(cfg.qsm_nbs_linearity_threshold))")
+    @info "[qsm] linear NBS filter" n_linear linearity_threshold=cfg.qsm_nbs_linearity_threshold
 
     if n_linear == 0
         setattribute!(pc, :qsm_node_id, zeros(Int32, N))
@@ -134,13 +134,13 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     qsm_node_ids = zeros(Int32, N)
     surface_parts = Matrix{Float64}[]
     surface_nbs_parts = Vector{Int32}[]
-    surface_cv_parts = Vector{Float64}[]
+    surface_rho_parts = Vector{Float64}[]
 
     for nid in 1:length(linear_nbs)
         info = linear_nbs[nid]
         info === nothing && continue
         nid32 = Int32(nid)
-        next_node_id, surf_pts, surf_cv = _process_single_nbs!(nodes, qsm_node_ids,
+        next_node_id, surf_pts, surf_rho = _process_single_nbs!(nodes, qsm_node_ids,
                                             coords, info, nid32,
                                             tree_ids, agh_values, cfg, next_node_id)
 
@@ -148,31 +148,32 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
         if size(surf_pts, 1) > 0
             push!(surface_parts, surf_pts)
             push!(surface_nbs_parts, fill(nid32, size(surf_pts, 1)))
-            push!(surface_cv_parts, surf_cv)
+            push!(surface_rho_parts, surf_rho)
         end
     end
 
-    println("[qsm] Created $(length(nodes)) QSM nodes")
+    @info "[qsm] QSM node creation" n_nodes=length(nodes)
 
     # Stage 3: Build output tables and write CSV / surface cloud
-    node_table, node_headers = _build_node_table(nodes)
-    tree_table, tree_headers = _build_tree_table(nodes, node_table, node_headers, cfg)
+    node_columns, node_headers, vol, sa = _build_node_table(nodes)
+    tree_columns, tree_headers = _build_tree_table(nodes, vol, sa, cfg)
 
-    n_trees = size(tree_table, 1)
-    println("[qsm] Aggregated to $(n_trees) trees")
+    n_nodes_out = isempty(node_columns) ? 0 : length(first(node_columns))
+    n_trees     = isempty(tree_columns) ? 0 : length(first(tree_columns))
+    @info "[qsm] tree aggregation" n_trees
 
     node_csv = joinpath(output_dir, "$(output_prefix)qsm_nodes.csv")
     tree_csv = joinpath(output_dir, "$(output_prefix)qsm_trees.csv")
 
     if !isempty(output_dir)
         mkpath(output_dir)
-        if size(node_table, 1) > 0
-            _write_csv(node_csv, node_table, node_headers)
-            println("[qsm] Wrote node biometrics: $node_csv")
+        if n_nodes_out > 0
+            _write_csv(node_csv, node_columns, node_headers)
+            @info "[qsm] wrote node biometrics" path=node_csv
         end
-        if size(tree_table, 1) > 0
-            _write_csv(tree_csv, tree_table, tree_headers)
-            println("[qsm] Wrote tree biometrics: $tree_csv")
+        if n_trees > 0
+            _write_csv(tree_csv, tree_columns, tree_headers)
+            @info "[qsm] wrote tree biometrics" path=tree_csv
         end
     end
 
@@ -181,23 +182,23 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     if !isempty(surface_parts)
         surf_coords = vcat(surface_parts...)
         surf_nbs = vcat(surface_nbs_parts...)
-        surf_cv = vcat(surface_cv_parts...)
-        qsm_surface_cloud = PointCloud(surf_coords, Dict{Symbol,Vector}(:tree_nbs_id => surf_nbs, :rho_cv => surf_cv))
-        println("[qsm] Generated QSM surface cloud: $(npoints(qsm_surface_cloud)) points")
+        surf_rho = vcat(surface_rho_parts...)
+        qsm_surface_cloud = PointCloud(surf_coords, Dict{Symbol,Vector}(:tree_nbs_id => surf_nbs, :rho => surf_rho))
+        @info "[qsm] generated QSM surface cloud" n_points=npoints(qsm_surface_cloud)
     else
         qsm_surface_cloud = PointCloud(Matrix{Float64}(undef, 0, 3), Dict{Symbol,Vector}())
     end
 
     if !isempty(output_dir) && npoints(qsm_surface_cloud) > 0
         write_pc(surf_cloud_path, qsm_surface_cloud)
-        println("[qsm] Wrote QSM surface cloud: $surf_cloud_path")
+        @info "[qsm] wrote QSM surface cloud" path=surf_cloud_path
     end
 
     # Add QSM node IDs to point cloud and overwrite tree cloud on disk
     setattribute!(pc, :qsm_node_id, qsm_node_ids)
     if !isempty(tree_cloud_path)
         write_pc(tree_cloud_path, pc)
-        println("[qsm] Overwrote tree cloud with qsm_node_id: $tree_cloud_path")
+        @info "[qsm] overwrote tree cloud with qsm_node_id" path=tree_cloud_path
     end
 
     return (
@@ -223,6 +224,10 @@ Filter NBS segments by linearity and return PCA results for qualifying ones,
 as a vector indexed by NBS id (1..K). Entries are `nothing` for ids with no
 points or that failed the linearity test. NBS ids are assumed dense from
 `tree_segmentation` (post `relabel_by_occurrence`).
+
+Delegates the geometric PCA + linearity check to `pca_linearity` (in
+geometry_utils.jl) and adds the QSM-specific tree-stem orientation: PC1 is
+flipped so it points from the lowest-z point to the highest-z point of the NBS.
 """
 function _filter_linear_nbs(coords::AbstractMatrix{<:Real},
                             nbs_ids::AbstractVector{<:Integer},
@@ -240,75 +245,28 @@ function _filter_linear_nbs(coords::AbstractMatrix{<:Real},
     @inbounds for nid in 1:K
         indices = nbs_groups[nid]
         isempty(indices) && continue
-        info = _compute_nbs_pca(coords, indices, Int32(nid), cfg.qsm_nbs_linearity_threshold)
-        info === nothing || (result[nid] = info)
+        pca = pca_linearity(coords, indices, cfg.qsm_nbs_linearity_threshold)
+        pca === nothing && continue
+
+        # Orient PC1 by z (tree-stem convention: PC1 from low-z to high-z)
+        d = pca.direction
+        c = pca.center
+        z_min_i = indices[1]; z_max_i = indices[1]
+        for i in indices
+            if coords[i, 3] < coords[z_min_i, 3]; z_min_i = i; end
+            if coords[i, 3] > coords[z_max_i, 3]; z_max_i = i; end
+        end
+        proj_low  = (coords[z_min_i, 1] - c[1]) * d[1] +
+                    (coords[z_min_i, 2] - c[2]) * d[2] +
+                    (coords[z_min_i, 3] - c[3]) * d[3]
+        proj_high = (coords[z_max_i, 1] - c[1]) * d[1] +
+                    (coords[z_max_i, 2] - c[2]) * d[2] +
+                    (coords[z_max_i, 3] - c[3]) * d[3]
+        dvec = proj_high < proj_low ? (-d[1], -d[2], -d[3]) : d
+
+        result[nid] = NBSInfo(dvec, pca.center, pca.eigenvalues, pca.linearity, indices)
     end
     return result
-end
-
-"""
-    _compute_nbs_pca(coords, indices) -> NBSInfo or nothing
-
-Compute PCA on the points of a single NBS. Returns NBSInfo if enough points
-and the segment is sufficiently linear, otherwise nothing.
-"""
-function _compute_nbs_pca(coords::AbstractMatrix{<:Real}, indices::Vector{Int},
-                          ::Int32, linearity_threshold::Float64)
-    n = length(indices)
-    n < 3 && return nothing
-
-    # Compute mean
-    mx = 0.0; my = 0.0; mz = 0.0
-    @inbounds for i in indices
-        mx += coords[i, 1]; my += coords[i, 2]; mz += coords[i, 3]
-    end
-    inv_n = 1.0 / n
-    mx *= inv_n; my *= inv_n; mz *= inv_n
-
-    # Build 3×3 covariance matrix
-    c11 = 0.0; c12 = 0.0; c13 = 0.0
-    c22 = 0.0; c23 = 0.0; c33 = 0.0
-    @inbounds for i in indices
-        dx = coords[i, 1] - mx
-        dy = coords[i, 2] - my
-        dz = coords[i, 3] - mz
-        c11 += dx * dx; c12 += dx * dy; c13 += dx * dz
-        c22 += dy * dy; c23 += dy * dz; c33 += dz * dz
-    end
-
-    C = Symmetric([c11 c12 c13; c12 c22 c23; c13 c23 c33])
-    F = eigen(C)
-    # eigenvalues in ascending order: F.values[1] ≤ [2] ≤ [3]
-    λ3 = F.values[3]
-    λ2 = F.values[2]
-    λ3 > 0 || return nothing
-
-    linearity = (λ3 - λ2) / λ3
-    linearity < linearity_threshold && return nothing
-
-    # PC1 = eigenvector of largest eigenvalue
-    dvec = (F.vectors[1, 3], F.vectors[2, 3], F.vectors[3, 3])
-
-    # Orient: direction points from low-z to high-z projection
-    z_min_i = 0; z_max_i = 0
-    @inbounds for i in indices
-        z = coords[i, 3]
-        if z_min_i == 0 || z < coords[z_min_i, 3]; z_min_i = i; end
-        if z_max_i == 0 || z > coords[z_max_i, 3]; z_max_i = i; end
-    end
-    proj_low = (coords[z_min_i, 1] - mx) * dvec[1] +
-               (coords[z_min_i, 2] - my) * dvec[2] +
-               (coords[z_min_i, 3] - mz) * dvec[3]
-    proj_high = (coords[z_max_i, 1] - mx) * dvec[1] +
-                (coords[z_max_i, 2] - my) * dvec[2] +
-                (coords[z_max_i, 3] - mz) * dvec[3]
-    if proj_high < proj_low
-        dvec = (-dvec[1], -dvec[2], -dvec[3])
-    end
-
-    return NBSInfo(dvec, (mx, my, mz),
-                   (F.values[1], F.values[2], F.values[3]),
-                   linearity, indices)
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -318,15 +276,15 @@ end
 """
     _process_single_nbs!(nodes, qsm_node_ids, coords, info, nbs_id, tree_ids,
                          agh_values, cfg, next_node_id)
-        -> (next_node_id, surface_pts, surface_cv)
+        -> (next_node_id, surface_pts, surface_rho)
 
 Process a single linear NBS through the full QSM pipeline.
 Appends `QSMNode` entries to `nodes` and writes the assigned QSM node id of
 every point of this NBS into `qsm_node_ids` (indexed in the global point cloud).
 
 Pipeline within this function:
-  2a  _slice_and_fit_centers  →  _smooth_centerline!         (slicing & centerline)
-  2b  _unroll_points          →  _compute_slice_rho_stats    (unroll + per-slice stats)
+  2a  _slice_and_fit_centers (incl. _finalize_centerline!) (slicing & centerline)
+  2b  _unroll_points          →  _filter_rho_outliers        (unroll + per-slice rho filter)
   2c  _method_spline_2d                                      (2D surface integration)
        └ writes QSMNodes + maps point→node →
   2d  _generate_surface_points                                (3D surface cloud)
@@ -341,47 +299,37 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
                               cfg::FLiPConfig,
                               next_node_id::Int)
     slice_res = cfg.qsm_slice_height_scalar * cfg.pipeline_subsample_res
-    indices = info.point_indices
 
-    # 2a: Slice, fit centers, smooth
-    centers, slice_point_indices, _, _, pt_slice_ids, e1, e2 =
+    # 2a: Slice, fit centers, interpolate, smooth. Per-slice QC inside
+    # _slice_and_fit_centers may drop points; `indices` is rebound here to the
+    # compacted survivor list (positions into `coords`), and pt_slice_ids /
+    # slice_point_indices are renumbered to match. The returned `centers`
+    # already has NaN slices interpolated and moving-window smoothing applied
+    # (both done inside `_finalize_centerline!`). Dropped points keep
+    # qsm_node_id = 0 by default.
+    centers, slice_point_indices, _, _, pt_slice_ids, e1, e2, indices =
         _slice_and_fit_centers(coords, info, slice_res, cfg.qsm_min_node_size,
-                               cfg.qsm_min_octant_taubin)
-    _smooth_centerline!(centers)
+                               cfg.qsm_min_octant_taubin, cfg)
 
-    # 2b: Unroll points to (rho, phi) and compute per-slice rho statistics
+    # 2b: Unroll points to (rho, phi)
     rho, phi = _unroll_points(coords, indices, centers, pt_slice_ids, e1, e2)
 
-    # Determine dominant tree_id for this NBS (single-pass argmax over dense tree ids)
-    K_trees_local = 0
-    @inbounds for j in eachindex(indices)
-        tid = Int(tree_ids[indices[j]])
-        tid > K_trees_local && (K_trees_local = tid)
-    end
-    dominant_tree = Int32(0)
-    if K_trees_local > 0
-        counts = zeros(Int, K_trees_local)
-        @inbounds for j in eachindex(indices)
-            tid = Int(tree_ids[indices[j]])
-            tid > 0 && (counts[tid] += 1)
-        end
-        max_count, k = findmax(counts)
-        max_count > 0 && (dominant_tree = Int32(k))
-    end
+    # 2b': Drop per-slice rho outliers before they touch any downstream stage
+    # (compacts indices / pt_slice_ids / slice_point_indices / rho / phi together).
+    n_slices = size(centers, 1)
+    rho, phi, pt_slice_ids, slice_point_indices, indices =
+        _filter_rho_outliers(rho, phi, pt_slice_ids, slice_point_indices, indices,
+                             n_slices, cfg.qsm_rho_percentile)
 
-    # The group key `nbs_id` is the merged tree_nbs_id (A1); they are identical by construction.
+    # All points in an NBS share the same tree_id (tree_segmentation assigns per-NBS),
+    # so a single lookup suffices instead of an argmax over a histogram.
+    dominant_tree = isempty(indices) ? Int32(0) : Int32(tree_ids[indices[1]])
     dominant_tree_nbs = nbs_id
 
-    n_slices = size(centers, 1)
-    rho_median_global = length(rho) > 0 ? median(rho) : 0.01
+    # 2c: 2D spline surface for all slices at once (rho already pre-filtered above)
+    spl_results, surface_grid, _ = _method_spline_2d(rho, phi, pt_slice_ids, n_slices, cfg)
 
-    slice_rho_mean, slice_rho_std, slice_rho_cv = _compute_slice_rho_stats(rho, pt_slice_ids, n_slices)
-
-    # 2c: 2D spline surface for all slices at once
-    spl_results, surface_grid, _ = _method_spline_2d(rho, phi, pt_slice_ids, n_slices, cfg, rho_median_global)
-
-    # Create QSMNode per qualifying slice
-    slice_nodes = QSMNode[]
+    # Create QSMNode per qualifying slice (push directly into `nodes`)
     node_id_per_slice = zeros(Int32, n_slices)
     for s in 1:n_slices
         local_js = slice_point_indices[s]
@@ -395,43 +343,23 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
         end
         mean_agh /= n_pts
 
-        # 2D spline (pre-computed)
+        # 2D spline (pre-computed); skip slices that fail the completeness gate.
         ca = spl_results[s].cross_area
         circ = spl_results[s].circumference
         completeness = spl_results[s].completeness
         completeness < cfg.qsm_completeness_threshold && continue
 
-        # Terminal/poorly-covered slice fallback: when the spline-derived radius is
-        # unreliable, recompute from a percentile of the slice's rho distribution so
-        # leafy/noisy outer points don't inflate the volume estimate. Defaults make
-        # this a no-op (threshold equal to qsm_completeness_threshold, percentile=1.0).
-        if completeness < cfg.qsm_terminal_completeness_threshold
-            p = cfg.qsm_terminal_rho_percentile
-            r_robust = if p >= 1.0
-                slice_rho_mean[s]
-            else
-                rho_slice = @view rho[local_js]
-                isempty(rho_slice) ? slice_rho_mean[s] : quantile(rho_slice, p)
-            end
-            ca   = π * r_robust^2
-            circ = 2π * r_robust
-        end
-
-        node = QSMNode(
+        push!(nodes, QSMNode(
             next_node_id, nbs_id, dominant_tree, dominant_tree_nbs,
             mean_agh, slice_res, completeness, n_pts,
             centers[s, 1], centers[s, 2], centers[s, 3],
             info.direction[1], info.direction[2], info.direction[3],
             ca, circ,
             sqrt(max(0.0, ca / π)), circ / (2π),
-            slice_rho_mean[s], slice_rho_std[s], slice_rho_cv[s],
-        )
-        push!(slice_nodes, node)
+        ))
         node_id_per_slice[s] = Int32(next_node_id)
         next_node_id += 1
     end
-
-    append!(nodes, slice_nodes)
 
     # Map each NBS point to its slice's QSM node (zero means no node assigned for that slice)
     @inbounds for j in eachindex(indices)
@@ -439,11 +367,12 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
         nid_q > 0 && (qsm_node_ids[indices[j]] = nid_q)
     end
 
-    # 2d: Generate surface point cloud from the smoothed 2D surface
-    gen_res = cfg.pipeline_subsample_res / 2.0
-    surface_pts, surface_cv = _generate_surface_points(surface_grid, centers, e1, e2, slice_res, gen_res, slice_rho_cv)
+    # 2d: Generate surface point cloud from the smoothed 2D surface, emitting
+    # the per-point surface radius as an attribute alongside coordinates.
+    gen_res = cfg.pipeline_subsample_res
+    surface_pts, surface_rho = _generate_surface_points(surface_grid, centers, e1, e2, slice_res, gen_res)
 
-    return (next_node_id, surface_pts, surface_cv)
+    return (next_node_id, surface_pts, surface_rho)
 end
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -451,20 +380,32 @@ end
 # ───────────────────────────────────────────────────────────────────────────────
 
 """
-    _slice_and_fit_centers(coords, info, slice_res, min_node_size)
-        -> (centers_3d, slice_indices, t_values)
+    _slice_and_fit_centers(coords, info, slice_res, min_node_size,
+                           min_octant_taubin, cfg)
+        -> (centers_3d, slice_point_indices, t_vals, t_min,
+            point_slice_ids_kept, e1, e2, indices_kept)
 
-Slice an NBS along PC1, fit circle centers per slice.
-Returns 3D centers (K×3), vector of point-index vectors per slice,
-and scalar t-values (projection on PC1) per point.
+Slice an NBS along PC1, run per-slice quality control (largest 3D CC with
+continuity tie-break + 3D statistical outlier removal), then fit a circle
+center per slice. QC is governed by `cfg.qsm_qc_*` fields; when
+`cfg.qsm_qc_enable` is `false` it is a no-op.
+
+Returns:
+- `centers_3d` — K×3 fitted centers (NaN-invalid slices interpolated)
+- `slice_point_indices` — per-slice positions into `indices_kept`
+- `t_vals` — PC1 projection of every *original* NBS point
+- `t_min` — minimum t (slice 1 starts here)
+- `point_slice_ids_kept` — slice id per *kept* point, parallel to `indices_kept`
+- `e1`, `e2` — orthonormal basis perpendicular to PC1
+- `indices_kept` — compacted global point indices (subset of `info.point_indices`)
 """
 function _slice_and_fit_centers(coords::AbstractMatrix{<:Real}, info::NBSInfo,
                                 slice_res::Float64, min_node_size::Int,
-                                min_octant_taubin::Int=3)
+                                min_octant_taubin::Int, cfg::FLiPConfig)
     d = info.direction
     cx, cy, cz = info.center
     indices = info.point_indices
-    e1, e2 = _perp_basis(d)
+    e1, e2 = _build_perpendicular_basis(d)
 
     n = length(indices)
     t_vals = Vector{Float64}(undef, n)
@@ -489,9 +430,20 @@ function _slice_and_fit_centers(coords::AbstractMatrix{<:Real}, info::NBSInfo,
         point_slice_ids[j] = s
     end
 
+    # Per-slice QC tuning (resolved once; reuses existing config knobs)
+    qc_enable  = cfg.qsm_qc_enable
+    cc_radius  = QC_CC_RADIUS_SCALAR * cfg.pipeline_subsample_res
+    cc_min     = cfg.qsm_min_node_size
+    cont_ratio = cfg.qsm_qc_continuity_ratio
+    sor_k      = cfg.statistical_filter_k_neighbors
+    sor_ns     = cfg.statistical_filter_n_sigma
+
     # Fit circle center per slice
     centers_3d = Matrix{Float64}(undef, n_slices, 3)
     valid_slices = falses(n_slices)
+    # Anchor for QC's continuity tie-break: the (cu, cv) of the last slice
+    # whose fit succeeded. Nothing until the first valid slice has been fit.
+    prev_centroid_uv = nothing
 
     for s in 1:n_slices
         local_js = slice_point_indices[s]
@@ -512,6 +464,20 @@ function _slice_and_fit_centers(coords::AbstractMatrix{<:Real}, info::NBSInfo,
             dz = coords[i, 3] - cz
             u_arr[k] = dx * e1[1] + dy * e1[2] + dz * e1[3]
             v_arr[k] = dx * e2[1] + dy * e2[2] + dz * e2[3]
+        end
+
+        # Per-slice QC: keep dominant 3D connected component (continuity tie-break
+        # against the previous slice's fitted center) then drop 3D statistical outliers.
+        if qc_enable && ns >= cc_min
+            local_js, u_arr, v_arr, ns, ok = _qc_clean_slice(
+                local_js, ns, u_arr, v_arr, indices, coords,
+                prev_centroid_uv, min_node_size,
+                cc_radius, cc_min, cont_ratio, sor_k, sor_ns)
+            if !ok
+                centers_3d[s, :] .= NaN
+                slice_point_indices[s] = Int[]
+                continue
+            end
         end
 
         # Angular coverage relative to NBS axis: count distinct octants (OCTANT_WIDTH wide)
@@ -544,6 +510,14 @@ function _slice_and_fit_centers(coords::AbstractMatrix{<:Real}, info::NBSInfo,
         end
         valid_slices[s] = true
 
+        # Anchor for next slice's continuity tie-break: use the fitted center,
+        # not the raw centroid, so partial arcs don't drag the anchor toward
+        # the arc side of the stem.
+        prev_centroid_uv = (cu, cv)
+
+        # Persist the cleaned slice subset (positions into the original indices).
+        slice_point_indices[s] = local_js
+
         # Convert 2D center back to 3D
         t_center = t_min + (s - 0.5) * slice_res
         centers_3d[s, 1] = cx + t_center * d[1] + cu * e1[1] + cv * e2[1]
@@ -551,49 +525,148 @@ function _slice_and_fit_centers(coords::AbstractMatrix{<:Real}, info::NBSInfo,
         centers_3d[s, 3] = cz + t_center * d[3] + cu * e1[3] + cv * e2[3]
     end
 
-    _interpolate_invalid_slices!(centers_3d, valid_slices, info, t_min, slice_res)
+    _finalize_centerline!(centers_3d, valid_slices, info, t_min, slice_res)
 
-    return (centers_3d, slice_point_indices, t_vals, t_min, point_slice_ids, e1, e2)
-end
-
-"""Build an orthonormal basis (e1, e2) perpendicular to direction d."""
-function _perp_basis(d::NTuple{3,Float64})
-    dx, dy, dz = d
-    # Choose axis least aligned with d
-    ax = abs(dx); ay = abs(dy); az = abs(dz)
-    if ax <= ay && ax <= az
-        ref = (1.0, 0.0, 0.0)
-    elseif ay <= az
-        ref = (0.0, 1.0, 0.0)
-    else
-        ref = (0.0, 0.0, 1.0)
+    # Compact indices / pt_slice_ids / slice_point_indices to drop QC-rejected
+    # points. Renumber slice_point_indices entries to point into the compacted
+    # `indices_kept` so all downstream consumers (_unroll_points,
+    # _build_rho_surface, the slice→node mapping)
+    # operate on a contiguous survivor set without zero sentinels.
+    kept_mask = falses(n)
+    @inbounds for s in 1:n_slices
+        for j in slice_point_indices[s]
+            kept_mask[j] = true
+        end
     end
-    # e1 = normalize(d × ref)
-    e1x = dy * ref[3] - dz * ref[2]
-    e1y = dz * ref[1] - dx * ref[3]
-    e1z = dx * ref[2] - dy * ref[1]
-    e1_norm = sqrt(e1x^2 + e1y^2 + e1z^2)
-    e1 = (e1x / e1_norm, e1y / e1_norm, e1z / e1_norm)
-    # e2 = d × e1
-    e2x = dy * e1[3] - dz * e1[2]
-    e2y = dz * e1[1] - dx * e1[3]
-    e2z = dx * e1[2] - dy * e1[1]
-    return (e1, (e2x, e2y, e2z))
+    n_kept = count(kept_mask)
+    indices_kept         = Vector{Int}(undef, n_kept)
+    point_slice_ids_kept = Vector{Int}(undef, n_kept)
+    old_to_new           = zeros(Int, n)
+    pos = 0
+    @inbounds for j in 1:n
+        if kept_mask[j]
+            pos += 1
+            indices_kept[pos]         = indices[j]
+            point_slice_ids_kept[pos] = point_slice_ids[j]
+            old_to_new[j] = pos
+        end
+    end
+    @inbounds for s in 1:n_slices
+        sj = slice_point_indices[s]
+        for k in eachindex(sj)
+            sj[k] = old_to_new[sj[k]]
+        end
+    end
+
+    return (centers_3d, slice_point_indices, t_vals, t_min,
+            point_slice_ids_kept, e1, e2, indices_kept)
 end
 
 """
-    _interpolate_invalid_slices!(centers, valid_slices, info, t_min, slice_res)
+    _qc_clean_slice(local_js, ns, u_arr, v_arr, indices, coords,
+                    prev_centroid_uv, min_node_size,
+                    cc_radius, cc_min, cont_ratio, sor_k, sor_ns)
+        -> (local_js, u_arr, v_arr, ns, ok)
 
-Fill NaN center rows by linear interpolation between nearest valid neighbors;
-fall back to the NBS axis at `t_min + (s - 0.5) * slice_res` if no valid
-neighbor exists on a side. Mutates `centers` in place.
+Per-slice quality control. SOR runs first on raw XYZ to drop noise, then a
+connected-component pass keeps the dominant component (with a continuity
+tie-break against the previous slice's fitted (u,v) center). Running SOR
+before CC prevents outlier "bridges" from spuriously merging two real
+components. Returns the cleaned `(local_js, u_arr, v_arr, ns)` subset plus
+`ok::Bool`, where `ok=false` means the slice has too few survivors to fit.
+
+SOR and CC both operate in 3D on raw xyz so they see the natural Euclidean
+geometry. The continuity tie-break uses (u,v) centroids against the previous
+slice's fitted center; this anchors the kept CC to the stem axis across
+slices, not to whichever CC happens to be largest in this particular slice.
 """
-function _interpolate_invalid_slices!(centers::Matrix{Float64},
-                                       valid_slices::AbstractVector{Bool},
-                                       info::NBSInfo,
-                                       t_min::Float64,
-                                       slice_res::Float64)
+function _qc_clean_slice(local_js::Vector{Int}, ns::Int,
+                          u_arr::Vector{Float64}, v_arr::Vector{Float64},
+                          indices::Vector{Int}, coords::AbstractMatrix{<:Real},
+                          prev_centroid_uv, min_node_size::Int,
+                          cc_radius::Float64, cc_min::Int,
+                          cont_ratio::Float64, sor_k::Int, sor_ns::Float64)
+    xyz_slice = Matrix{Float64}(undef, ns, 3)
+    @inbounds for k in 1:ns
+        i = indices[local_js[k]]
+        xyz_slice[k, 1] = coords[i, 1]
+        xyz_slice[k, 2] = coords[i, 2]
+        xyz_slice[k, 3] = coords[i, 3]
+    end
+
+    # 3D statistical outlier removal on raw coordinates — first, so outlier
+    # bridges can't spuriously connect two true components in the CC pass.
+    inliers = statistical_filter(xyz_slice, sor_k, sor_ns)
+    if length(inliers) < min_node_size
+        return (local_js, u_arr, v_arr, ns, false)
+    end
+    local_js  = local_js[inliers]
+    u_arr     = u_arr[inliers]
+    v_arr     = v_arr[inliers]
+    xyz_slice = xyz_slice[inliers, :]
+    ns        = length(local_js)
+
+    # Connected-component labelling on the SOR-cleaned slice
+    cc_labels = connected_component_labels(xyz_slice, cc_radius, cc_min)
+
+    chosen_label = 1
+    n_comp = maximum(cc_labels; init=0)
+    if n_comp >= 2 && prev_centroid_uv !== nothing
+        sizes = zeros(Int, n_comp)
+        @inbounds for k in 1:ns
+            L = cc_labels[k]
+            L > 0 && (sizes[L] += 1)
+        end
+        if sizes[2] >= cont_ratio * sizes[1]
+            u1 = 0.0; v1 = 0.0; c1 = 0
+            u2 = 0.0; v2 = 0.0; c2 = 0
+            @inbounds for k in 1:ns
+                L = cc_labels[k]
+                if L == 1
+                    u1 += u_arr[k]; v1 += v_arr[k]; c1 += 1
+                elseif L == 2
+                    u2 += u_arr[k]; v2 += v_arr[k]; c2 += 1
+                end
+            end
+            u1 /= c1; v1 /= c1; u2 /= c2; v2 /= c2
+            pu, pv = prev_centroid_uv
+            if (u2 - pu)^2 + (v2 - pv)^2 < (u1 - pu)^2 + (v1 - pv)^2
+                chosen_label = 2
+            end
+        end
+    end
+
+    keep_mask = cc_labels .== chosen_label
+    if count(keep_mask) < min_node_size
+        return (local_js, u_arr, v_arr, ns, false)
+    end
+    local_js = local_js[keep_mask]
+    u_arr    = u_arr[keep_mask]
+    v_arr    = v_arr[keep_mask]
+    return (local_js, u_arr, v_arr, length(local_js), true)
+end
+
+"""
+    _finalize_centerline!(centers, valid_slices, info, t_min, slice_res; window=2)
+
+Produce the final centerline matrix in place in two passes:
+1. Fill NaN rows by linear interpolation between nearest valid neighbors;
+   fall back to the NBS axis at `t_min + (s - 0.5) * slice_res` if no valid
+   neighbor exists on a side.
+2. Smooth the resulting centerline with a moving-window average of
+   half-width `window`. Pass `window=0` to skip the smoothing pass.
+
+Both passes mutate `centers`.
+"""
+function _finalize_centerline!(centers::Matrix{Float64},
+                                valid_slices::AbstractVector{Bool},
+                                info::NBSInfo,
+                                t_min::Float64,
+                                slice_res::Float64;
+                                window::Int=2)
     n_slices = size(centers, 1)
+
+    # Pass 1: interpolate NaN slices from nearest valid neighbors (axis fallback)
     d = info.direction
     cx, cy, cz = info.center
     for s in 1:n_slices
@@ -619,29 +692,23 @@ function _interpolate_invalid_slices!(centers::Matrix{Float64},
             centers[s, 3] = cz + t_center * d[3]
         end
     end
-    return centers
-end
 
-"""
-    _smooth_centerline!(centers, window)
-
-Apply moving-window average to smooth the centerline in-place.
-"""
-function _smooth_centerline!(centers::Matrix{Float64}, window::Int=2)
-    n = size(centers, 1)
-    n <= 1 && return centers
-    buf = similar(centers)
-    @inbounds for s in 1:n
-        lo = max(1, s - window)
-        hi = min(n, s + window)
-        cnt = hi - lo + 1
-        sx = 0.0; sy = 0.0; sz = 0.0
-        for k in lo:hi
-            sx += centers[k, 1]; sy += centers[k, 2]; sz += centers[k, 3]
+    # Pass 2: moving-window average smoothing (in place via single scratch buf)
+    if window > 0 && n_slices > 1
+        buf = similar(centers)
+        @inbounds for s in 1:n_slices
+            lo = max(1, s - window)
+            hi = min(n_slices, s + window)
+            cnt = hi - lo + 1
+            sx = 0.0; sy = 0.0; sz = 0.0
+            for k in lo:hi
+                sx += centers[k, 1]; sy += centers[k, 2]; sz += centers[k, 3]
+            end
+            buf[s, 1] = sx / cnt; buf[s, 2] = sy / cnt; buf[s, 3] = sz / cnt
         end
-        buf[s, 1] = sx / cnt; buf[s, 2] = sy / cnt; buf[s, 3] = sz / cnt
+        centers .= buf
     end
-    centers .= buf
+
     return centers
 end
 
@@ -748,38 +815,67 @@ function _unroll_points(coords::AbstractMatrix{<:Real}, indices::Vector{Int},
 end
 
 """
-    _compute_slice_rho_stats(rho, pt_slice_ids, n_slices) -> (mean, std, cv)
+    _filter_rho_outliers(rho, phi, pt_slice_ids, slice_point_indices, indices,
+                          n_slices, rho_percentile)
+        -> (rho, phi, pt_slice_ids, slice_point_indices, indices)
 
-Per-slice mean / std / coefficient-of-variation of the unrolled rho distribution.
-Two passes over `rho`: first for sums and counts, second for variance.
+For each slice, drop points whose `rho` exceeds the per-slice
+`quantile(rho_slice, rho_percentile)`. The kept points are returned as a
+compacted survivor set so all downstream consumers (`_method_spline_2d`,
+`_generate_surface_points`, slice→node mapping) operate on contiguous arrays
+without sentinel handling.
+
+When `rho_percentile >= 1.0` returns the inputs unchanged (no-op fast path).
 """
-function _compute_slice_rho_stats(rho::AbstractVector{<:Real},
-                                   pt_slice_ids::AbstractVector{<:Integer},
-                                   n_slices::Int)
-    slice_mean = zeros(n_slices)
-    slice_std  = zeros(n_slices)
-    slice_cv   = zeros(n_slices)
-    counts     = zeros(Int, n_slices)
-    @inbounds for j in eachindex(rho)
-        s = Int(pt_slice_ids[j])
-        slice_mean[s] += rho[j]
-        counts[s] += 1
-    end
+function _filter_rho_outliers(rho::Vector{Float64}, phi::Vector{Float64},
+                               pt_slice_ids::Vector{Int},
+                               slice_point_indices::Vector{Vector{Int}},
+                               indices::Vector{Int},
+                               n_slices::Int,
+                               rho_percentile::Float64)
+    rho_percentile >= 1.0 && return (rho, phi, pt_slice_ids, slice_point_indices, indices)
+
+    # Per-slice rho cutoffs (Inf for slices with no points → keeps no-op for them)
+    thresh = fill(Inf, n_slices)
     @inbounds for s in 1:n_slices
-        counts[s] > 0 && (slice_mean[s] /= counts[s])
+        ids = slice_point_indices[s]
+        isempty(ids) && continue
+        thresh[s] = quantile(@view(rho[ids]), rho_percentile)
     end
-    @inbounds for j in eachindex(rho)
-        s = Int(pt_slice_ids[j])
-        d = rho[j] - slice_mean[s]
-        slice_std[s] += d * d
+
+    n = length(rho)
+    keep_mask = falses(n)
+    @inbounds for j in 1:n
+        keep_mask[j] = rho[j] <= thresh[pt_slice_ids[j]]
     end
+
+    n_kept = count(keep_mask)
+    rho_kept           = Vector{Float64}(undef, n_kept)
+    phi_kept           = Vector{Float64}(undef, n_kept)
+    pt_slice_ids_kept  = Vector{Int}(undef, n_kept)
+    indices_kept       = Vector{Int}(undef, n_kept)
+    old_to_new         = zeros(Int, n)
+    pos = 0
+    @inbounds for j in 1:n
+        if keep_mask[j]
+            pos += 1
+            rho_kept[pos]          = rho[j]
+            phi_kept[pos]          = phi[j]
+            pt_slice_ids_kept[pos] = pt_slice_ids[j]
+            indices_kept[pos]      = indices[j]
+            old_to_new[j] = pos
+        end
+    end
+
+    slice_point_indices_kept = [Int[] for _ in 1:n_slices]
     @inbounds for s in 1:n_slices
-        c = counts[s]
-        slice_std[s] = c > 1 ? sqrt(slice_std[s] / (c - 1)) : 0.0
-        m = slice_mean[s]
-        slice_cv[s] = m > 0 ? slice_std[s] / m : 0.0
+        for j in slice_point_indices[s]
+            nj = old_to_new[j]
+            nj > 0 && push!(slice_point_indices_kept[s], nj)
+        end
     end
-    return (slice_mean, slice_std, slice_cv)
+
+    return (rho_kept, phi_kept, pt_slice_ids_kept, slice_point_indices_kept, indices_kept)
 end
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -787,29 +883,29 @@ end
 # ───────────────────────────────────────────────────────────────────────────────
 
 """
-    _method_spline_2d(rho, phi, pt_slice_ids, n_slices, cfg, rho_median_global)
+    _method_spline_2d(rho, phi, pt_slice_ids, n_slices, cfg)
         -> Vector{NamedTuple{(:cross_area, :circumference, :completeness)}}
 
 Compute cross-sectional area and circumference for all slices of an NBS
 using 2D surface smoothing (periodic in phi, non-periodic in z).
 Returns a vector indexed by slice (1:n_slices); slices with no data
-have zeros.
+have zeros. The angular bin count adapts to NBS size via the median of `rho`.
 """
 function _method_spline_2d(rho::Vector{Float64}, phi::Vector{Float64},
                            pt_slice_ids::Vector{Int}, n_slices::Int,
-                           cfg::FLiPConfig, rho_median_global::Float64)
+                           cfg::FLiPConfig)
     T = NamedTuple{(:cross_area, :circumference, :completeness), Tuple{Float64, Float64, Float64}}
     results = Vector{T}(undef, n_slices)
     fill!(results, (cross_area=0.0, circumference=0.0, completeness=0.0))
 
+    rho_median_global = isempty(rho) ? 0.01 : median(rho)
     surface_res = cfg.qsm_surface_res_scalar * cfg.pipeline_subsample_res
     phi_bin_num = clamp(ceil(Int, 2π * rho_median_global / surface_res),
                         cfg.qsm_phi_bin_min, cfg.qsm_phi_bin_max)
     dphi = 2π / phi_bin_num
 
-    # Build 2D surface
-    surface = _build_rho_surface(rho, phi, pt_slice_ids, n_slices, phi_bin_num,
-                                cfg.qsm_rho_percentile)
+    # Build 2D surface (rho already pre-filtered upstream via cfg.qsm_rho_percentile)
+    surface = _build_rho_surface(rho, phi, pt_slice_ids, n_slices, phi_bin_num)
 
     # Compute completeness per slice before gap-filling
     completeness = Vector{Float64}(undef, n_slices)
@@ -845,73 +941,35 @@ function _method_spline_2d(rho::Vector{Float64}, phi::Vector{Float64},
 end
 
 """
-    _build_rho_surface(rho, phi, pt_slice_ids, n_slices, phi_bin_num; rho_percentile=1.0)
+    _build_rho_surface(rho, phi, pt_slice_ids, n_slices, phi_bin_num)
         -> Matrix{Float64}  # (phi_bin_num, n_slices)
 
-Bin all NBS points into a 2D grid of rho values. Empty cells are NaN.
-
-When `rho_percentile >= 1.0` (default), each cell is the arithmetic mean of all
-rho values. When `< 1.0`, the top `(1 - rho_percentile)` fraction of rho
-values per cell is discarded before averaging, shrinking the fit toward the
-inner surface (removing noise and leaf returns at large radii).
+Bin all NBS points into a 2D grid of rho values; each cell is the arithmetic
+mean of all rho values falling into it, empty cells are NaN. Rho-outlier
+filtering happens upstream in `_filter_rho_outliers` (driven by
+`cfg.qsm_rho_percentile`), so this routine has no percentile knob of its own.
 """
 function _build_rho_surface(rho::Vector{Float64}, phi::Vector{Float64},
                             pt_slice_ids::Vector{Int}, n_slices::Int,
-                            phi_bin_num::Int,
-                            rho_percentile::Float64=1.0)
+                            phi_bin_num::Int)
     dphi = 2π / phi_bin_num
+    bin_sum = zeros(phi_bin_num, n_slices)
+    bin_count = zeros(Int, phi_bin_num, n_slices)
 
-    if rho_percentile >= 1.0
-        # Fast path: single-pass mean (original behavior)
-        bin_sum = zeros(phi_bin_num, n_slices)
-        bin_count = zeros(Int, phi_bin_num, n_slices)
-
-        @inbounds for j in eachindex(rho)
-            b = clamp(floor(Int, (phi[j] + π) / dphi) + 1, 1, phi_bin_num)
-            s = pt_slice_ids[j]
-            bin_sum[b, s] += rho[j]
-            bin_count[b, s] += 1
-        end
-
-        surface = fill(NaN, phi_bin_num, n_slices)
-        @inbounds for s in 1:n_slices, b in 1:phi_bin_num
-            if bin_count[b, s] > 0
-                surface[b, s] = bin_sum[b, s] / bin_count[b, s]
-            end
-        end
-        return surface
-    else
-        # Percentile path: collect per-cell rho, discard top fraction, average remainder
-        # Outer points (large rho) are more likely noise/leaf returns, so we keep
-        # the inner rho_percentile fraction and discard the rest.
-        cell_rhos = Dict{Int, Vector{Float64}}()
-        @inbounds for j in eachindex(rho)
-            b = clamp(floor(Int, (phi[j] + π) / dphi) + 1, 1, phi_bin_num)
-            s = pt_slice_ids[j]
-            key = (s - 1) * phi_bin_num + b
-            v = get!(cell_rhos, key) do; Float64[] end
-            push!(v, rho[j])
-        end
-
-        surface = fill(NaN, phi_bin_num, n_slices)
-        for (key, rhos) in cell_rhos
-            b = mod1(key, phi_bin_num)
-            s = (key - 1) ÷ phi_bin_num + 1
-            if length(rhos) == 1
-                surface[b, s] = rhos[1]
-            else
-                thresh = quantile(rhos, rho_percentile)
-                s_sum = 0.0; s_count = 0
-                for r in rhos
-                    if r <= thresh
-                        s_sum += r; s_count += 1
-                    end
-                end
-                surface[b, s] = s_count > 0 ? s_sum / s_count : mean(rhos)
-            end
-        end
-        return surface
+    @inbounds for j in eachindex(rho)
+        b = clamp(floor(Int, (phi[j] + π) / dphi) + 1, 1, phi_bin_num)
+        s = pt_slice_ids[j]
+        bin_sum[b, s] += rho[j]
+        bin_count[b, s] += 1
     end
+
+    surface = fill(NaN, phi_bin_num, n_slices)
+    @inbounds for s in 1:n_slices, b in 1:phi_bin_num
+        if bin_count[b, s] > 0
+            surface[b, s] = bin_sum[b, s] / bin_count[b, s]
+        end
+    end
+    return surface
 end
 
 """
@@ -1007,9 +1065,9 @@ function _smooth_surface_2d!(surface::Matrix{Float64},
             w_side_z = s_z / 2.0
             @inbounds for s in 1:nz, b in 1:nphi
                 if s == 1
-                    surface[b, s] = (1.0 - s_z) * buf[b, s] + s_z * buf[b, 2]
+                    surface[b, s] = w_center_z * buf[b, s] + s_z * buf[b, 2]
                 elseif s == nz
-                    surface[b, s] = (1.0 - s_z) * buf[b, s] + s_z * buf[b, nz - 1]
+                    surface[b, s] = w_center_z * buf[b, s] + s_z * buf[b, nz - 1]
                 else
                     surface[b, s] = w_center_z * buf[b, s] +
                                      w_side_z * (buf[b, s - 1] + buf[b, s + 1])
@@ -1024,21 +1082,22 @@ end
 # ───────────────────────────────────────────────────────────────────────────────
 
 """
-    _generate_surface_points(surface, centers, e1, e2, slice_res, gen_res, slice_rho_cv)
-        -> (Matrix{Float64}, Vector{Float64})  # (M×3 coords, M rho_cv values)
+    _generate_surface_points(surface, centers, e1, e2, slice_res, gen_res)
+        -> (Matrix{Float64}, Vector{Float64})  # (M×3 coords, M surface rho values)
 
 Convert a smoothed 2D rho surface (phi × z-slice) to 3D xyz points.
 Linearly interpolates between z-slices to achieve approximately `gen_res`
-axial spacing. Returns coordinates and per-point `rho_cv` (interpolated
-between slices for inter-slice points).
+axial spacing. Returns coordinates and the per-point surface radius (rho),
+which equals the smoothed surface value at each generated point (slice points
+take `surface[b, s]`; inter-slice points take the linear blend between
+slices s and s+1).
 """
 function _generate_surface_points(surface::Matrix{Float64},
                                    centers::Matrix{Float64},
                                    e1::NTuple{3,Float64},
                                    e2::NTuple{3,Float64},
                                    slice_res::Float64,
-                                   gen_res::Float64,
-                                   slice_rho_cv::Vector{Float64})
+                                   gen_res::Float64)
     nphi, nslices = size(surface)
     dphi = 2π / nphi
     n_zsub = max(1, ceil(Int, slice_res / gen_res))
@@ -1046,11 +1105,10 @@ function _generate_surface_points(surface::Matrix{Float64},
     # Upper bound for pre-allocation
     n_est = nphi * (nslices + max(0, nslices - 1) * (n_zsub - 1))
     pts = Matrix{Float64}(undef, n_est, 3)
-    cv_vals = Vector{Float64}(undef, n_est)
+    rho_vals = Vector{Float64}(undef, n_est)
     idx = 0
 
     @inbounds for s in 1:nslices
-        cv_s = slice_rho_cv[s]
         # Points at slice center
         for b in 1:nphi
             rho = surface[b, s]
@@ -1062,7 +1120,7 @@ function _generate_surface_points(surface::Matrix{Float64},
             pts[idx, 1] = centers[s, 1] + u * e1[1] + v * e2[1]
             pts[idx, 2] = centers[s, 2] + u * e1[2] + v * e2[2]
             pts[idx, 3] = centers[s, 3] + u * e1[3] + v * e2[3]
-            cv_vals[idx] = cv_s
+            rho_vals[idx] = rho
         end
 
         # Interpolated points between slice s and s+1
@@ -1072,7 +1130,6 @@ function _generate_surface_points(surface::Matrix{Float64},
                 icx = centers[s, 1] + frac * (centers[s+1, 1] - centers[s, 1])
                 icy = centers[s, 2] + frac * (centers[s+1, 2] - centers[s, 2])
                 icz = centers[s, 3] + frac * (centers[s+1, 3] - centers[s, 3])
-                cv_interp = cv_s + frac * (slice_rho_cv[s+1] - cv_s)
                 for b in 1:nphi
                     rho1 = surface[b, s]
                     rho2 = surface[b, s+1]
@@ -1085,14 +1142,14 @@ function _generate_surface_points(surface::Matrix{Float64},
                     pts[idx, 1] = icx + u * e1[1] + v * e2[1]
                     pts[idx, 2] = icy + u * e1[2] + v * e2[2]
                     pts[idx, 3] = icz + u * e1[3] + v * e2[3]
-                    cv_vals[idx] = cv_interp
+                    rho_vals[idx] = rho
                 end
             end
         end
     end
 
     if idx > 0
-        return (pts[1:idx, :], cv_vals[1:idx])
+        return (pts[1:idx, :], rho_vals[1:idx])
     else
         return (Matrix{Float64}(undef, 0, 3), Float64[])
     end
@@ -1114,13 +1171,15 @@ end
 # ═══════════════════════════════════════════════════════════════════════════════
 
 """
-    _build_node_table(nodes) -> Matrix{Any}
+    _build_node_table(nodes) -> (columns, headers, vol, sa)
 
-Build the node-level results table as a matrix for CSV output.
-Includes frustum volume computation.
+Build the node-level results as a vector of typed per-column vectors (each
+element of `columns` is one column, in `headers` order). Also returns the
+per-node frustum `vol` and `sa` vectors directly so `_build_tree_table` can
+aggregate them without round-tripping through a stringly-typed lookup.
 """
 function _build_node_table(nodes::Vector{QSMNode})
-    isempty(nodes) && return (Matrix{Any}(undef, 0, 0), String[])
+    isempty(nodes) && return (AbstractVector[], String[], Float64[], Float64[])
 
     # Group by NBS for frustum computation (NBS ids are dense from tree_segmentation)
     nbs_ids_per_node = Int32[nd.nbs_id for nd in nodes]
@@ -1166,39 +1225,44 @@ function _build_node_table(nodes::Vector{QSMNode})
         "completeness", "n_points",
         "center_x", "center_y", "center_z",
         "direction_x", "direction_y", "direction_z",
-        "rho_mean", "rho_std", "rho_cv",
     ]
 
-    table = Matrix{Any}(undef, n, length(headers))
-    for i in 1:n
-        nd = nodes[i]
-        table[i, :] = Any[
-            nd.qsm_node_id, nd.nbs_id, nd.tree_id, nd.agh,
-            nd.cross_area, nd.circumference,
-            nd.radius_area, nd.radius_circ,
-            nd.height, vol[i], sa[i],
-            nd.completeness, nd.n_points,
-            nd.center_x, nd.center_y, nd.center_z,
-            nd.direction_x, nd.direction_y, nd.direction_z,
-            nd.rho_mean, nd.rho_std, nd.rho_cv,
-        ]
-    end
+    columns = AbstractVector[
+        Int[nd.qsm_node_id for nd in nodes],
+        Int32[nd.nbs_id for nd in nodes],
+        Int32[nd.tree_id for nd in nodes],
+        Float64[nd.agh for nd in nodes],
+        Float64[nd.cross_area for nd in nodes],
+        Float64[nd.circumference for nd in nodes],
+        Float64[nd.radius_area for nd in nodes],
+        Float64[nd.radius_circ for nd in nodes],
+        Float64[nd.height for nd in nodes],
+        vol,
+        sa,
+        Float64[nd.completeness for nd in nodes],
+        Int[nd.n_points for nd in nodes],
+        Float64[nd.center_x for nd in nodes],
+        Float64[nd.center_y for nd in nodes],
+        Float64[nd.center_z for nd in nodes],
+        Float64[nd.direction_x for nd in nodes],
+        Float64[nd.direction_y for nd in nodes],
+        Float64[nd.direction_z for nd in nodes],
+    ]
 
-    return (table, headers)
+    return (columns, headers, vol, sa)
 end
 
 """
-    _build_tree_table(nodes, node_table, headers, cfg) -> (Matrix{Any}, Vector{String})
+    _build_tree_table(nodes, vol, sa, cfg) -> (columns, headers)
 
-Aggregate node-level results to tree-level biometrics.
+Aggregate node-level results to tree-level biometrics. `vol` and `sa` are the
+per-node frustum volume / surface area vectors returned by `_build_node_table`
+(parallel to `nodes`).
 """
-function _build_tree_table(nodes::Vector{QSMNode}, node_table::Matrix{Any},
-                           headers::Vector{String}, cfg::FLiPConfig)
-    isempty(nodes) && return (Matrix{Any}(undef, 0, 0), String[])
-
-    # Column indices
-    col_vol = findfirst(==("volume"), headers)
-    col_sa = findfirst(==("surface_area"), headers)
+function _build_tree_table(nodes::Vector{QSMNode},
+                           vol::Vector{Float64}, sa::Vector{Float64},
+                           cfg::FLiPConfig)
+    isempty(nodes) && return (AbstractVector[], String[])
 
     # Group by tree_id (dense ids from tree_segmentation); output ordered by tree_id ascending
     tree_ids_per_node = Int32[nd.tree_id for nd in nodes]
@@ -1214,15 +1278,22 @@ function _build_tree_table(nodes::Vector{QSMNode}, node_table::Matrix{Any},
         "x", "y",
     ]
 
-    tree_table = Matrix{Any}(undef, n_trees, length(tree_headers))
+    col_tree_id  = Vector{Int32}(undef, n_trees)
+    col_volume   = Vector{Float64}(undef, n_trees)
+    col_surface  = Vector{Float64}(undef, n_trees)
+    col_height   = Vector{Float64}(undef, n_trees)
+    col_dbh_a    = Vector{Float64}(undef, n_trees)
+    col_dbh_c    = Vector{Float64}(undef, n_trees)
+    col_n_points = Vector{Int}(undef, n_trees)
+    col_n_nodes  = Vector{Int}(undef, n_trees)
+    col_x        = Vector{Float64}(undef, n_trees)
+    col_y        = Vector{Float64}(undef, n_trees)
 
     for (ti, idxs) in enumerate(tree_groups)
-        tid = nodes[idxs[1]].tree_id
-
-        total_vol = sum(i -> Float64(node_table[i, col_vol]), idxs)
-        total_sa = sum(i -> Float64(node_table[i, col_sa]), idxs)
+        total_vol = sum(i -> vol[i], idxs)
+        total_sa  = sum(i -> sa[i],  idxs)
         total_pts = sum(i -> nodes[i].n_points, idxs)
-        max_agh = maximum(i -> nodes[i].agh, idxs)
+        max_agh   = maximum(i -> nodes[i].agh, idxs)
 
         # DBH: find node closest to breast height
         best_bh_idx = idxs[1]
@@ -1234,44 +1305,24 @@ function _build_tree_table(nodes::Vector{QSMNode}, node_table::Matrix{Any},
                 best_bh_idx = i
             end
         end
-        dbh_a = 2.0 * nodes[best_bh_idx].radius_area
-        dbh_c = 2.0 * nodes[best_bh_idx].radius_circ
 
-        loc_x = nodes[best_bh_idx].center_x
-        loc_y = nodes[best_bh_idx].center_y
-
-        tree_table[ti, :] = Any[
-            tid,
-            total_vol, total_sa,
-            max_agh,
-            dbh_a, dbh_c,
-            total_pts, length(idxs),
-            loc_x, loc_y,
-        ]
+        col_tree_id[ti]  = nodes[idxs[1]].tree_id
+        col_volume[ti]   = total_vol
+        col_surface[ti]  = total_sa
+        col_height[ti]   = max_agh
+        col_dbh_a[ti]    = 2.0 * nodes[best_bh_idx].radius_area
+        col_dbh_c[ti]    = 2.0 * nodes[best_bh_idx].radius_circ
+        col_n_points[ti] = total_pts
+        col_n_nodes[ti]  = length(idxs)
+        col_x[ti]        = nodes[best_bh_idx].center_x
+        col_y[ti]        = nodes[best_bh_idx].center_y
     end
 
-    return (tree_table, tree_headers)
+    columns = AbstractVector[
+        col_tree_id, col_volume, col_surface, col_height,
+        col_dbh_a, col_dbh_c, col_n_points, col_n_nodes,
+        col_x, col_y,
+    ]
+    return (columns, tree_headers)
 end
 
-"""
-    _write_csv(path, table, headers)
-
-Write a matrix with headers to a CSV file using DelimitedFiles.
-"""
-function _write_csv(path::String, table::Matrix{Any}, headers::Vector{String})
-    open(path, "w") do io
-        println(io, join(headers, ","))
-        for i in 1:size(table, 1)
-            vals = String[]
-            for j in 1:size(table, 2)
-                v = table[i, j]
-                if v isa AbstractFloat
-                    push!(vals, string(round(v; sigdigits=8)))
-                else
-                    push!(vals, string(v))
-                end
-            end
-            println(io, join(vals, ","))
-        end
-    end
-end

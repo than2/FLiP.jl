@@ -634,3 +634,36 @@ function read_pc_metadata(path::AbstractString; scan_index::Int=-1)
         error("Unsupported point cloud format: $ext (supported: .las, .laz, .e57)")
     end
 end
+
+# ── Generic CSV writer ────────────────────────────────────────────
+
+"""
+    _write_csv(path, columns, headers)
+
+Write per-column typed vectors to a CSV file under the given header names.
+`columns` and `headers` must be parallel; every column must have the same
+length. Floats are rounded to 8 significant digits; other values are
+stringified with `string()`.
+"""
+function _write_csv(path::String, columns::Vector{<:AbstractVector}, headers::Vector{String})
+    length(columns) == length(headers) ||
+        throw(ArgumentError("columns ($(length(columns))) and headers ($(length(headers))) must have the same length"))
+    isempty(columns) && return
+    n_rows = length(first(columns))
+    n_cols = length(columns)
+    open(path, "w") do io
+        println(io, join(headers, ","))
+        for i in 1:n_rows
+            vals = String[]
+            for j in 1:n_cols
+                v = columns[j][i]
+                if v isa AbstractFloat
+                    push!(vals, string(round(v; sigdigits=8)))
+                else
+                    push!(vals, string(v))
+                end
+            end
+            println(io, join(vals, ","))
+        end
+    end
+end
