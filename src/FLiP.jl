@@ -91,7 +91,6 @@ export relabel_by_occurrence, group_indices_by_label
 export statistical_filter
 export grid_zmin_filter, upward_conic_filter
 export voxel_connected_component_filter
-export rnn_filter
 export segment_ground
 export XY_polygon_filter
 export convex_hull_2d, buffer_polygon, polygon_area

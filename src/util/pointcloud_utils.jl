@@ -7,7 +7,6 @@ a per-point label vector.
 Functions:
 - `distance_subsample(points, min_dist)`                       — keep points at least `min_dist` apart
 - `statistical_filter(points, k, n_sigma)`                     — drop K-NN outliers beyond mean + n·σ
-- `rnn_filter(points, radius; min_rnn_size)`                   — drop points with too few neighbours in `radius`
 - `grid_zmin_filter(points, grid_size)`                        — keep min-z point per XY grid cell
 - `voxel_connected_component_filter(points, voxel_size; min_cc_size)`
                                                                — drop voxel components smaller than `min_cc_size`
@@ -157,49 +156,6 @@ function statistical_filter(points::AbstractMatrix{<:Real},
     return keep
 end
 
-# ── Density filtering ─────────────────────────────────────────────
-
-"""
-    rnn_filter(points::AbstractMatrix{<:Real}, radius::Real;
-               min_rnn_size::Int=1) -> Vector{Int}
-
-Radius-based neighbor count (RNN) filter returning indices of points with
-sufficient local density.
-
-For each point, counts the number of neighbors (including itself) within
-`radius`. Only points with neighbor count >= `min_rnn_size` are kept.
-
-# Arguments
-- `points`: N×3 matrix of XYZ coordinates
-- `radius`: Search radius for neighbor queries (must be > 0)
-- `min_rnn_size`: Minimum neighbor count to keep a point (must be >= 1)
-
-# Returns
-- `Vector{Int}`: Indices of points with sufficient local density (sorted ascending)
-"""
-function rnn_filter(points::AbstractMatrix{<:Real}, radius::Real;
-                    min_rnn_size::Int=_CFG.rnn_filter_min_rnn_size)
-    size(points, 2) == 3 || throw(ArgumentError("points must be N×3 matrix"))
-    radius > 0 || throw(ArgumentError("radius must be > 0"))
-    min_rnn_size >= 1 || throw(ArgumentError("min_rnn_size must be >= 1"))
-
-    n = size(points, 1)
-    n == 0 && return Int[]
-
-    tree = KDTree(points')
-    keep = Int[]
-    sizehint!(keep, n)
-
-    @inbounds for i in 1:n
-        q = SVector(points[i, 1], points[i, 2], points[i, 3])
-        if length(inrange(tree, q, radius)) >= min_rnn_size
-            push!(keep, i)
-        end
-    end
-
-    return keep
-end
-
 # ── Spatial-grid filtering ────────────────────────────────────────
 
 """
@@ -272,7 +228,7 @@ for removing small isolated fragments but is not exact Euclidean connectivity.
 - `Vector{Int}`: Indices of kept points (sorted ascending)
 """
 function voxel_connected_component_filter(points::AbstractMatrix{<:Real}, voxel_size::Real;
-                                          min_cc_size::Int=_CFG.voxel_cc_filter_min_cc_size)
+                                          min_cc_size::Int=1)
     size(points, 2) == 3 || throw(ArgumentError("points must be N×3 matrix"))
     voxel_size > 0 || throw(ArgumentError("voxel_size must be > 0"))
     min_cc_size >= 1 || throw(ArgumentError("min_cc_size must be >= 1"))
@@ -368,7 +324,7 @@ also tends to give better-quality ground anchors).
 - `Vector{Int}`: Indices of kept points (sorted ascending)
 """
 function upward_conic_filter(points::AbstractMatrix{<:Real}, cone_theta_deg::Real;
-                             max_search_delta_z::Real=_CFG.upward_conic_filter_max_search_delta_z)
+                             max_search_delta_z::Real=5.0)
     size(points, 2) == 3 || throw(ArgumentError("points must be N×3 matrix"))
     0 < cone_theta_deg < 90 || throw(ArgumentError("cone_theta_deg must satisfy 0 < angle < 90"))
     max_search_delta_z > 0 || throw(ArgumentError("max_search_delta_z must be > 0"))

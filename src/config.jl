@@ -18,15 +18,6 @@ mutable struct FLiPConfig
     statistical_filter_k_neighbors::Int
     statistical_filter_n_sigma::Float64
 
-    # voxel_connected_component_filter
-    voxel_cc_filter_min_cc_size::Int
-
-    # upward_conic_filter
-    upward_conic_filter_max_search_delta_z::Float64
-
-    # rnn_filter
-    rnn_filter_min_rnn_size::Int
-
     # segment_ground
     segment_ground_voxel_size::Float64
     segment_ground_min_cc_size::Int
@@ -89,9 +80,6 @@ end
 
 function FLiPConfig(d::Dict)
     sf = get(d, "statistical_filter",               Dict{String,Any}())
-    vc = get(d, "voxel_connected_component_filter", Dict{String,Any}())
-    uc = get(d, "upward_conic_filter",              Dict{String,Any}())
-    rn = get(d, "rnn_filter",                       Dict{String,Any}())
     sg = get(d, "segment_ground",                   Dict{String,Any}())
     pp = get(d, "preprocess",                       Dict{String,Any}())
     ts = get(d, "tree_segmentation",                Dict{String,Any}())
@@ -101,9 +89,6 @@ function FLiPConfig(d::Dict)
     FLiPConfig(
         Int(get(sf, "k_neighbors",         6)),
         Float64(get(sf, "n_sigma",         1.0)),
-        Int(get(vc, "min_cc_size",         1)),
-        Float64(get(uc, "max_search_delta_z", 5.0)),
-        Int(get(rn, "min_rnn_size",        1)),
         Float64(get(sg, "voxel_size",      0.5)),
         Int(get(sg, "min_cc_size",         50)),
         Float64(get(sg, "grid_size",       0.5)),

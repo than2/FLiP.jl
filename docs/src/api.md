@@ -34,35 +34,19 @@ write_las
 write_laz
 ```
 
-### PCD Format
-
-```@docs
-read_pcd
-write_pcd
-```
-
-### PTX Format
-
-```@docs
-read_ptx
-```
-
 ## Subsampling
 
 ```@docs
-voxel_grid_downsample
-voxel_grid_downsample_indices
 distance_subsample
-distance_subsample_indices
 ```
 
 ## Filtering
 
 ```@docs
 statistical_filter
-statistical_filter_indices
-grid_zmin_filter_indices
-upward_conic_filter_indices
+grid_zmin_filter
+upward_conic_filter
+voxel_connected_component_filter
 ```
 
 ## Transformations

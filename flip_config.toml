@@ -66,12 +66,3 @@ qc_continuity_ratio = 0.7       # If 2nd-largest CC size ≥ ratio × largest, b
 [statistical_filter]
 k_neighbors = 6       # Number of nearest neighbors for mean-distance computation
 n_sigma     = 1.0     # Outlier threshold: mean + n_sigma * std
-
-[voxel_connected_component_filter]
-min_cc_size = 1       # Minimum component size (in points) to keep
-
-[upward_conic_filter]
-max_search_delta_z = 5.0  # Vertical span (m) used to cap horizontal search radius
-
-[rnn_filter]
-min_rnn_size = 1      # Minimum number of neighbors within radius to keep a point

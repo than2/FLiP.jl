@@ -104,49 +104,6 @@
         @test upward_conic_filter(boundary_coords, 45.0, max_search_delta_z=5.0) == [1]
     end
 
-    @testset "RNN (radius neighbor count) filter" begin
-        # Create a sparse cluster with varying density
-        # Center cluster: 5 points within 0.5m
-        center_points = [
-            0.0  0.0  0.0;
-            0.2  0.0  0.0;
-            0.1  0.1  0.0;
-            0.15 0.2  0.0;
-            0.3  0.1  0.0;
-        ]
-        # Outliers: isolated points far away
-        outliers = [
-            10.0  0.0  0.0;
-            20.0  0.0  0.0;
-        ]
-        coords = vcat(center_points, outliers)
-
-        # With radius 0.5, center cluster has 5 points each (including self)
-        indices = rnn_filter(coords, 0.5, min_rnn_size=1)
-        @test length(indices) == size(coords, 1)  # All have at least 1 neighbor
-        
-        # Keep only points with at least 3 neighbors within 0.5m
-        indices = rnn_filter(coords, 0.5, min_rnn_size=3)
-        @test indices == [1, 2, 3, 4, 5]  # Only center cluster qualifies
-        
-        # Keep only points with at least 5 neighbors within 0.5m
-        indices = rnn_filter(coords, 0.5, min_rnn_size=5)
-        @test indices == [1, 2, 3, 4, 5]  # All have exactly 5 neighbors
-        
-        # Keep only points with at least 6 neighbors
-        indices = rnn_filter(coords, 0.5, min_rnn_size=6)
-        @test isempty(indices)  # No points have 6 neighbors
-
-        # Empty input
-        @test isempty(rnn_filter(zeros(0, 3), 0.5))
-        
-        # Error handling
-        @test_throws ArgumentError rnn_filter(coords, 0.0)
-        @test_throws ArgumentError rnn_filter(coords, -0.5)
-        @test_throws ArgumentError rnn_filter(coords, 0.5, min_rnn_size=0)
-        @test_throws ArgumentError rnn_filter(rand(10, 2), 0.5)
-    end
-    
     @testset "Filtering preserves attributes" begin
         coords = randn(Float64, 100, 3)
         test_attr = rand(Float64, 100)
@@ -291,8 +248,7 @@
         pts = randn(1000, 3)
         polygon = [-2.0 -2.0; 2.0 -2.0; 2.0 2.0; -2.0 2.0]
 
-        for idx in (rnn_filter(pts, 0.5),
-                    voxel_connected_component_filter(pts, 0.1),
+        for idx in (voxel_connected_component_filter(pts, 0.1),
                     XY_polygon_filter(pts, polygon))
             @test idx isa Vector{Int}
             @test issorted(idx)

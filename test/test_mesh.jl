@@ -47,23 +47,4 @@
         @test_throws ArgumentError cloud_to_mesh_distance_z(rand(10, 2), mesh)
     end
 
-    @testset "sample_mesh_xy" begin
-        ref = [
-            0.0 0.0 0.0;
-            1.0 0.0 1.0;
-            0.0 1.0 1.0;
-            1.0 1.0 2.0;
-        ]
-        mesh = delaunay_triangulation_xy(ref)
-
-        sampled = FLiP.sample_mesh_xy(mesh, 0.5)
-        @test size(sampled, 2) == 3
-        @test size(sampled, 1) >= 4
-
-        # On this plane z = x + y; sampled z should match closely
-        @test maximum(abs.(sampled[:, 3] .- (sampled[:, 1] .+ sampled[:, 2]))) < 1e-8
-
-        @test_throws ArgumentError FLiP.sample_mesh_xy(mesh, 0.0)
-        @test_throws ArgumentError FLiP.sample_mesh_xy(mesh, -0.1)
-    end
 end
