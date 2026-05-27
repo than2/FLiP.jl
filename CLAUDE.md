@@ -26,26 +26,29 @@ Approach every task as a Julia expert: write idiomatic, type-stable, allocation-
 ```
 src/
   FLiP.jl               # Module root — exports, includes
-  pointcloud.jl         # PointCloud struct + accessors
-  io.jl                 # read/write LAS/LAZ/E57 + file-path helpers + CSV writer
   config.jl             # FLiPConfig (hierarchical sub-structs) + TOML loading
+  io.jl                 # read/write LAS/LAZ/E57 + file-path helpers + CSV writer
+  types/
+    pointcloud.jl       # PointCloud struct + accessors + metadata
+    mesh.jl             # XYTriMesh + Delaunay triangulation + cloud-to-mesh distance
   util/
     array_utils.jl      # union-find, group-by-label, frequency-rank labelling
     geometry_utils.jl   # convex hull, polygon buffer, polygon area,
                         # 3D PCA + linearity (pca_linearity), perpendicular basis
-    interpolation.jl    # IDW interpolation (used by AGH)
-    pointcloud_utils.jl # subsampling + filtering (return indices) + CC labelling
     graph_utils.jl      # graph construction, subset-aware CC + Dijkstra, NBS
                         # expansion, slice/proto-node generation, branching refine
+    interpolation.jl    # IDW interpolation (used by AGH)
+    logging.jl          # [FLiP] prefix, stage timing, ProgressReporter (thread-safe)
+    pointcloud_utils.jl # subsampling + filtering (return indices) + CC labelling
+    transformations.jl  # translate, rotate, scale, transform, bounding_box_crop
+                        # (PointCloud-in / PointCloud-out coordinate operations)
   preprocess.jl         # preprocessing pipeline
   ground_segmentation.jl# Voxel CC pre-filter + grid z-min + upward conic + AGH
-  mesh.jl               # Mesh distance utilities
   tree_segmentation.jl  # NBS labelling + assembly + orphan rescue
   qsm.jl                # Full QSM pipeline (NBS linearity, slicing, 2D periodic
                         # surface fit, frustum geometry, CSV outputs)
   generate_report.jl    # Report stub (future)
   main.jl               # run_pipeline() orchestration
-  transformations.jl    # translate, rotate, scale, crop
 test/
   runtests.jl
   test_array_utils.jl, test_filtering.jl, test_geometry.jl, test_graph.jl,
@@ -59,7 +62,7 @@ scripts/                # Benchmarking and profiling scripts
 
 ### Key data conventions
 - Point coordinates are stored as **N×3 Float64 matrices** (rows = points, cols = X/Y/Z).
-- Point clouds are `PointCloud` structs; always use the accessor functions in `pointcloud.jl` (`coordinates`, `getattribute`, `setattribute!`, `npoints`, `bounds`, etc.) rather than touching struct fields directly.
+- Point clouds are `PointCloud` structs; always use the accessor functions in `types/pointcloud.jl` (`coordinates`, `getattribute`, `setattribute!`, `npoints`, `bounds`, etc.) rather than touching struct fields directly.
 - Subsetting uses **integer index vectors**; avoid Boolean masks for large clouds (extra allocation).
 - Spatial queries use `NearestNeighbors.KDTree` — always build the tree on a **3×N transposed** matrix.
 

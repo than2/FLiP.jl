@@ -46,7 +46,7 @@ using MultivariateStats
 using Rotations
 
 # Include submodules
-include("pointcloud.jl")
+include("types/pointcloud.jl")
 include("config.jl")
 include("util/logging.jl")
 include("io.jl")
@@ -56,13 +56,13 @@ include("util/pointcloud_utils.jl")
 include("util/interpolation.jl")
 include("preprocess.jl")
 include("ground_segmentation.jl")
-include("mesh.jl")
+include("types/mesh.jl")
 include("util/graph_utils.jl")
 include("tree_segmentation.jl")
 include("qsm.jl")
 include("generate_report.jl")
 include("main.jl")
-include("transformations.jl")
+include("util/transformations.jl")
 
 # Export types
 export PointCloud
