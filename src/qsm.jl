@@ -250,29 +250,32 @@ function _filter_linear_nbs(coords::AbstractMatrix{<:Real},
     end
 
     result = Vector{Union{Nothing, NBSInfo}}(nothing, K)
-    @inbounds for nid in 1:K
+    # Embarrassingly parallel by NBS id: writes to distinct `result[nid]`.
+    # `pca_linearity` allocates a local 3×3 covariance per call; no shared
+    # mutable state. `nbs_groups` is fully populated above and read-only here.
+    parallel_for(K, effective_nthreads(cfg)) do nid
         indices = nbs_groups[nid]
-        isempty(indices) && continue
+        isempty(indices) && return
         pca = pca_linearity(coords, indices, cfg.qsm.nbs_linearity_threshold)
-        pca === nothing && continue
+        pca === nothing && return
 
         # Orient PC1 by z (tree-stem convention: PC1 from low-z to high-z)
         d = pca.direction
         c = pca.center
         z_min_i = indices[1]; z_max_i = indices[1]
-        for i in indices
+        @inbounds for i in indices
             if coords[i, 3] < coords[z_min_i, 3]; z_min_i = i; end
             if coords[i, 3] > coords[z_max_i, 3]; z_max_i = i; end
         end
-        proj_low  = (coords[z_min_i, 1] - c[1]) * d[1] +
-                    (coords[z_min_i, 2] - c[2]) * d[2] +
-                    (coords[z_min_i, 3] - c[3]) * d[3]
-        proj_high = (coords[z_max_i, 1] - c[1]) * d[1] +
-                    (coords[z_max_i, 2] - c[2]) * d[2] +
-                    (coords[z_max_i, 3] - c[3]) * d[3]
+        @inbounds proj_low  = (coords[z_min_i, 1] - c[1]) * d[1] +
+                              (coords[z_min_i, 2] - c[2]) * d[2] +
+                              (coords[z_min_i, 3] - c[3]) * d[3]
+        @inbounds proj_high = (coords[z_max_i, 1] - c[1]) * d[1] +
+                              (coords[z_max_i, 2] - c[2]) * d[2] +
+                              (coords[z_max_i, 3] - c[3]) * d[3]
         dvec = proj_high < proj_low ? (-d[1], -d[2], -d[3]) : d
 
-        result[nid] = NBSInfo(dvec, pca.center, pca.eigenvalues, pca.linearity, indices)
+        @inbounds result[nid] = NBSInfo(dvec, pca.center, pca.eigenvalues, pca.linearity, indices)
     end
     return result
 end
@@ -1299,7 +1302,10 @@ function _build_tree_table(nodes::Vector{QSMNode},
     col_x        = Vector{Float64}(undef, n_trees)
     col_y        = Vector{Float64}(undef, n_trees)
 
-    for (ti, idxs) in enumerate(tree_groups)
+    # Embarrassingly parallel: each tree writes a distinct row of every column.
+    # `tree_groups`, `nodes`, `vol`, `sa` are read-only here.
+    parallel_for(n_trees, effective_nthreads(cfg)) do ti
+        idxs = tree_groups[ti]
         total_vol = sum(i -> vol[i], idxs)
         total_sa  = sum(i -> sa[i],  idxs)
         total_pts = sum(i -> nodes[i].n_points, idxs)
@@ -1316,16 +1322,18 @@ function _build_tree_table(nodes::Vector{QSMNode},
             end
         end
 
-        col_tree_id[ti]  = nodes[idxs[1]].tree_id
-        col_volume[ti]   = total_vol
-        col_surface[ti]  = total_sa
-        col_height[ti]   = max_agh
-        col_dbh_a[ti]    = 2.0 * nodes[best_bh_idx].radius_area
-        col_dbh_c[ti]    = 2.0 * nodes[best_bh_idx].radius_circ
-        col_n_points[ti] = total_pts
-        col_n_nodes[ti]  = length(idxs)
-        col_x[ti]        = nodes[best_bh_idx].center_x
-        col_y[ti]        = nodes[best_bh_idx].center_y
+        @inbounds begin
+            col_tree_id[ti]  = nodes[idxs[1]].tree_id
+            col_volume[ti]   = total_vol
+            col_surface[ti]  = total_sa
+            col_height[ti]   = max_agh
+            col_dbh_a[ti]    = 2.0 * nodes[best_bh_idx].radius_area
+            col_dbh_c[ti]    = 2.0 * nodes[best_bh_idx].radius_circ
+            col_n_points[ti] = total_pts
+            col_n_nodes[ti]  = length(idxs)
+            col_x[ti]        = nodes[best_bh_idx].center_x
+            col_y[ti]        = nodes[best_bh_idx].center_y
+        end
     end
 
     columns = AbstractVector[

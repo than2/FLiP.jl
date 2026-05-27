@@ -115,3 +115,40 @@ function report!(p::ProgressReporter, n_done::Integer; extra::AbstractString="")
         return
     end
 end
+
+# ── Bounded parallel-for ──────────────────────────────────────────────────
+
+"""
+    parallel_for(f, n::Integer, n_thread::Integer)
+
+Run `f(i)` for `i in 1:n`, splitting work across at most `n_thread` concurrent
+tasks via `@sync` / `Threads.@spawn`. Static contiguous chunking — index `i` is
+processed by exactly one task. Falls back to a plain serial loop when
+`n_thread <= 1`, `n <= 1`, or `Threads.nthreads() == 1`.
+
+`n_thread` should be the resolved thread budget from `effective_nthreads(cfg)`.
+The function does not consult any global config; callers pass the count
+explicitly.
+
+`f` is specialized via the `where {F}` type parameter to avoid closure boxing.
+"""
+function parallel_for(f::F, n::Integer, n_thread::Integer) where {F}
+    n <= 0 && return nothing
+    nt = min(Int(n_thread), Int(n))
+    if nt <= 1 || Threads.nthreads() == 1
+        @inbounds for i in 1:n
+            f(i)
+        end
+        return nothing
+    end
+    chunk_size = cld(Int(n), nt)
+    @sync for c in 1:nt
+        lo = (c - 1) * chunk_size + 1
+        hi = min(c * chunk_size, Int(n))
+        lo > Int(n) && break
+        Threads.@spawn @inbounds for i in lo:hi
+            f(i)
+        end
+    end
+    return nothing
+end

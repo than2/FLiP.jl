@@ -119,20 +119,37 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     tree_offset        = Int32(0)
 
     # Per-CC progress reported as % of cumulative points processed. The reporter
-    # is thread-safe (atomic CAS), so a future `Threads.@threads` adoption only
-    # needs a shared atomic counter for `processed_points`.
+    # is thread-safe (atomic CAS); the counter is a shared `Threads.Atomic{Int}`
+    # so it remains correct under `parallel_for`.
     progress = ProgressReporter("processing components", N)
-    processed_points = 0
+    processed_points = Threads.Atomic{Int}(0)
 
-    for (ci, cc_indices) in enumerate(cc_indices_by_id)
-        cc_n = length(cc_indices)
+    # Phase 2a (parallel): run the per-component pipeline. Each call to
+    # `_process_single_connected_component` is fully self-contained — its
+    # workspace structs and intermediate arrays are allocated per-call. Results
+    # are stored at distinct `results[ci]` slots; nothing else mutates here.
+    # Peak memory grows by up to T × per-component intermediates (see plan).
+    results = Vector{Any}(undef, n_components)
+    parallel_for(n_components, effective_nthreads(cfg)) do ci
+        @inbounds begin
+            cc_indices = cc_indices_by_id[ci]
+            cc_coords  = coords_filtered[cc_indices, :]
+            cc_agh     = agh_filtered[cc_indices]
+            results[ci] = _process_single_connected_component(cc_coords, cc_agh,
+                                                              neighbor_radius; cfg=cfg)
+            n_now = Threads.atomic_add!(processed_points, length(cc_indices)) +
+                    length(cc_indices)
+            report!(progress, n_now; extra="$ci/$n_components")
+        end
+    end
 
-        cc_coords = coords_filtered[cc_indices, :]
-        cc_agh    = agh_filtered[cc_indices]
+    # Phase 2b (serial): prefix-sum offsets and apply local → global remapping +
+    # skeleton accumulation. Order-dependent (offsets carry forward) so kept
+    # serial; per-CC work here is just index arithmetic.
+    for ci in 1:n_components
+        cc_indices = cc_indices_by_id[ci]
+        res = results[ci]
 
-        res = _process_single_connected_component(cc_coords, cc_agh, neighbor_radius; cfg=cfg)
-
-        # Map local → global labels with running offsets
         local_nbs_max  = Int32(maximum(res.nbs_id;  init=0))
         local_node_max = Int32(maximum(res.node_id; init=0))
         local_tree_max = Int32(maximum(res.tree_id; init=0))
@@ -147,7 +164,6 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
             global_tree_nbs_id[gi] = tnid > 0 ? tnid + nbs_offset  : Int32(0)
         end
 
-        # Accumulate skeleton cloud + edges with vertex offset
         skel_cloud = res.skeleton_cloud
         if npoints(skel_cloud) > 0
             push!(all_skel_coords, coordinates(skel_cloud))
@@ -162,12 +178,10 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
         nbs_offset  += local_nbs_max
         node_offset += local_node_max
         tree_offset += local_tree_max
-
-        processed_points += cc_n
-        report!(progress, processed_points; extra="$ci/$n_components")
     end
 
     empty!(cc_indices_by_id)   # release after per-component loop
+    empty!(results)             # release per-component result holders
 
     # ── Step 4: merge skeletons across components ─────────────────
     if isempty(all_skel_coords)
@@ -1174,28 +1188,33 @@ function process_orphan_segments(
 
         # Single pass populates coarse_o2t, orphan_to_tree_nbs_v, and the
         # `orphan_conn_nodes` set used by the node-based frac_connected metric.
-        @inbounds for orph_idx in 1:K_orphan
-            orph_pts  = orphan_nbs_points[orph_idx]
-            o2t       = coarse_o2t[orph_idx]
-            o2tn      = orphan_to_tree_nbs_v[orph_idx]
-            conn_nset = orphan_conn_nodes[orph_idx]
-            for i in orph_pts
-                query = SVector{3, Float64}(coords[i, 1], coords[i, 2], coords[i, 3])
-                hits = inrange(kdtree, query, occlusion_tol)
-                point_has_tree_conn = false
-                for j in hits
-                    aid  = assigned_idx[j]
-                    tid  = tree_id[aid]
-                    tnid = tree_nbs_id[aid]
-                    tid > 0 || continue
-                    point_has_tree_conn = true
-                    o2t[tid] = get(o2t, tid, 0) + 1
-                    tnid > 0 || continue
-                    key = (tid, tnid)
-                    o2tn[key] = get(o2tn, key, 0) + 1
-                end
-                if point_has_tree_conn
-                    push!(conn_nset, Int(node_id[i]))
+        # Embarrassingly parallel by orphan index: every container written below
+        # (`o2t`, `o2tn`, `conn_nset`) is the per-orphan element of an
+        # already-allocated per-orphan vector; `kdtree` is read-only.
+        parallel_for(K_orphan, effective_nthreads(cfg)) do orph_idx
+            @inbounds begin
+                orph_pts  = orphan_nbs_points[orph_idx]
+                o2t       = coarse_o2t[orph_idx]
+                o2tn      = orphan_to_tree_nbs_v[orph_idx]
+                conn_nset = orphan_conn_nodes[orph_idx]
+                for i in orph_pts
+                    query = SVector{3, Float64}(coords[i, 1], coords[i, 2], coords[i, 3])
+                    hits = inrange(kdtree, query, occlusion_tol)
+                    point_has_tree_conn = false
+                    for j in hits
+                        aid  = assigned_idx[j]
+                        tid  = tree_id[aid]
+                        tnid = tree_nbs_id[aid]
+                        tid > 0 || continue
+                        point_has_tree_conn = true
+                        o2t[tid] = get(o2t, tid, 0) + 1
+                        tnid > 0 || continue
+                        key = (tid, tnid)
+                        o2tn[key] = get(o2tn, key, 0) + 1
+                    end
+                    if point_has_tree_conn
+                        push!(conn_nset, Int(node_id[i]))
+                    end
                 end
             end
         end

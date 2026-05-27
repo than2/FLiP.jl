@@ -111,7 +111,8 @@ considered outliers.
 """
 function statistical_filter(points::AbstractMatrix{<:Real},
                             k_neighbors::Int=_CFG.statistical_filter.k_neighbors,
-                            n_sigma::Real=_CFG.statistical_filter.n_sigma)
+                            n_sigma::Real=_CFG.statistical_filter.n_sigma;
+                            n_thread::Integer=effective_nthreads())
     size(points, 2) == 3 || throw(ArgumentError("points must be N×3 matrix"))
     k_neighbors > 0 || throw(ArgumentError("k_neighbors must be > 0"))
     n_sigma > 0 || throw(ArgumentError("n_sigma must be > 0"))
@@ -130,16 +131,20 @@ function statistical_filter(points::AbstractMatrix{<:Real},
     # Per-iteration SVector keeps the query stack-allocated; inline sum avoids
     # allocating `dists[2:end]`. Per-point KNN (rather than batch) keeps peak
     # memory bounded — batching allocates O(N·k) result vectors.
+    # Embarrassingly parallel: `tree` is read-only and `mean_dists[i]` slots
+    # are disjoint per iteration.
     mean_dists = Vector{Float64}(undef, n)
 
-    @inbounds for i in 1:n
-        q = SVector(points[i, 1], points[i, 2], points[i, 3])
-        _, dists = knn(tree, q, k_neighbors + 1)
-        s = 0.0
-        for j in 2:length(dists)  # skip dists[1] (the point itself)
-            s += dists[j]
+    parallel_for(n, n_thread) do i
+        @inbounds begin
+            q = SVector(points[i, 1], points[i, 2], points[i, 3])
+            _, dists = knn(tree, q, k_neighbors + 1)
+            s = 0.0
+            for j in 2:length(dists)  # skip dists[1] (the point itself)
+                s += dists[j]
+            end
+            mean_dists[i] = s / (length(dists) - 1)
         end
-        mean_dists[i] = s / (length(dists) - 1)
     end
 
     # Compute statistics

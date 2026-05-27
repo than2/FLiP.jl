@@ -31,7 +31,7 @@ coordinate_precision = "Float32"      # "Float32" (memory-efficient) or "Float64
 subsample_res = 0.05                  # Minimum point spacing (m) for optional subsampling
 
 # --- Stage toggles (true = run, false = skip) ---
-enable_subsample           = false    # If true, downstream stages use the subsampled cloud
+enable_subsample           = true    # If true, downstream stages use the subsampled cloud
 enable_preprocess          = true     # Stage 1: optional denoising
 enable_ground_segmentation = true     # Stage 2: ground vs. above-ground split
 enable_agh                 = true     # Above-ground-height attribute via IDW interpolation
@@ -41,6 +41,16 @@ enable_generate_report     = true     # Optional summary report (currently place
 
 # --- Logging ---
 enable_debug_info = false             # If true, show low-level helper @info logs (assembly iteration, orphan rescue, etc.); default false silences them
+
+# --- Threading ---
+# Number of threads for parallelizable inner loops (statistical_filter, NBS PCA,
+# orphan KDTree voting, tree aggregation, per-connected-component segmentation).
+# Positive  → use that many threads (capped by Julia's --threads count).
+# 0 or 1    → serial (default).
+# Negative  → Sys.CPU_THREADS + n_thread (e.g. -1 = all-but-one logical core).
+# Julia must be launched with `julia --threads=N` (or JULIA_NUM_THREADS=N) for
+# this to have any effect.
+n_thread = 1
 
 # --- AGH interpolation (only used if enable_agh = true) ---
 xy_resolution = 0.05                  # Grid cell size (m) for IDW interpolation

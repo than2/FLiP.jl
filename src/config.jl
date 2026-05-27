@@ -129,6 +129,11 @@ mutable struct PipelineCfg
 
     # Logging
     enable_debug_info::Bool
+
+    # Threading: positive = exact thread count; 0/1 = serial;
+    # negative = Sys.CPU_THREADS + n_thread (e.g. -1 = all-but-one).
+    # Always capped at `Threads.nthreads()` at use time.
+    n_thread::Int
 end
 PipelineCfg(d::Dict) = PipelineCfg(
     String(get(d, "input_path",    "")),
@@ -152,6 +157,7 @@ PipelineCfg(d::Dict) = PipelineCfg(
     Bool(get(d, "enable_qsm",                 true)),
     Bool(get(d, "enable_generate_report",     true)),
     Bool(get(d, "enable_debug_info",          false)),
+    Int( get(d, "n_thread",                   1)),
 )
 
 # ── Top-level wrapper ────────────────────────────────────────────────────────
@@ -234,3 +240,27 @@ const _CFG = FLiPConfig(
 Return the configured coordinate precision type (`Float32` or `Float64`).
 """
 coord_type(cfg::FLiPConfig=_CFG) = cfg.pipeline.coordinate_precision
+
+"""
+    effective_nthreads(cfg::FLiPConfig=_CFG) -> Int
+
+Resolve the configured `pipeline.n_thread` to a concrete positive thread count.
+
+- positive → that many threads
+- 0 or 1   → serial (returns 1)
+- negative → `Sys.CPU_THREADS + n_thread` (e.g. `-1` = all-but-one logical core)
+
+The result is always capped at `Threads.nthreads()` (the count Julia was
+launched with) and never returns less than 1.
+"""
+function effective_nthreads(cfg::FLiPConfig=_CFG)
+    n = cfg.pipeline.n_thread
+    requested = if n > 1
+        n
+    elseif n < 0
+        max(1, Sys.CPU_THREADS + n)
+    else
+        1
+    end
+    return min(requested, Threads.nthreads())
+end
