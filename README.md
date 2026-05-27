@@ -9,9 +9,10 @@ A high-performance Julia package for processing 3D point cloud data from LiDAR a
 
 - **Format Support**: Read and write LAS, LAZ, and E57 files with auto-dispatch via `read_pc`/`write_pc`
 - **Subsampling**: Minimum-distance subsampling with spatial grid hashing
-- **Noise Filtering**: Statistical outlier removal, radius-neighbor filtering, and voxel connected-component filtering
-- **Ground Segmentation**: Two-stage pipeline (grid z-min + upward conic filter) with above-ground height calculation
-- **Tree Segmentation**: Non-Branching Segments (NBS) and Longest Connected Segments (LCS) algorithms for individual tree extraction
+- **Noise Filtering**: Statistical outlier removal and voxel connected-component filtering
+- **Ground Segmentation**: Voxel CC pre-filter + grid z-min + upward conic filter, with above-ground height (AGH) computed via IDW interpolation
+- **Tree Segmentation**: Non-Branching Segments (NBS) extraction and assembly into per-tree clusters, with orphan rescue for ground-disconnected branches
+- **QSM (Quantitative Structural Modeling)**: per-branch slicing, 2D periodic surface smoothing for cross-section fitting, frustum geometry → DBH / volume / surface area per tree
 - **Graph Algorithms**: Radius graphs, connected components, quotient graphs, and shortest-path slicing
 - **Mesh Operations**: Delaunay triangulation and cloud-to-mesh distance computation
 - **Transformations**: Translation, rotation, scaling, arbitrary affine transforms, and bounding box crop
@@ -33,23 +34,29 @@ Pkg.develop(url="https://github.com/xiangtaoxu/FLiP.jl")
 
 ## Quick Start
 
+Filter primitives return `Vector{Int}` indices over an N×3 coordinate matrix —
+index back into the `PointCloud` to materialize a filtered subset:
+
 ```julia
 using FLiP
 
-# Read a point cloud
-pc = read_laz("input.laz")
+# Read a point cloud (auto-dispatch by extension)
+pc = read_pc("input.laz")
 
-# Subsample using minimum distance (5cm)
-pc_sub = distance_subsample(pc, 0.05)
+# Subsample by minimum point spacing (5 cm)
+indices = distance_subsample(coordinates(pc), 0.05)
+pc_sub = pc[indices]
 
-# Remove statistical outliers
-pc_clean = statistical_filter(pc_sub, 10, 2.0)
+# Remove statistical outliers (returns inlier indices)
+indices = statistical_filter(coordinates(pc_sub), 6, 1.0)
+pc_clean = pc_sub[indices]
 
-# Apply transformation
-pc_transformed = translate(pc_clean, 100.0, 200.0, 0.0)
+# Apply a transformation and save
+pc_out = translate(pc_clean, 100.0, 200.0, 0.0)
+write_pc("output.laz", pc_out)
 
-# Save result
-write_laz("output.laz", pc_transformed)
+# — or — run the full end-to-end pipeline from a TOML config:
+run_pipeline("flip_config.toml")
 ```
 
 ## Core Functionality
@@ -72,34 +79,37 @@ pc = read_pc("file.laz")
 write_pc("output.e57", pc)
 
 # Read metadata without loading point data
-meta = read_laz_metadata("file.laz")
+meta = read_pc_metadata("file.laz")   # or read_las_metadata / read_e57_metadata
 ```
 
 ### Subsampling
 
 ```julia
-# Minimum distance subsampling
-pc_sub = distance_subsample(pc, 0.03)
-
-# Get indices only (for custom processing)
-indices = distance_subsample_indices(coordinates(pc), 0.03)
+# Minimum distance subsampling — returns Vector{Int} indices over the coord matrix
+indices = distance_subsample(coordinates(pc), 0.03)
 pc_sub = pc[indices]
 ```
 
 ### Filtering
 
+All filter primitives take an N×3 coordinate matrix and return inlier indices
+as `Vector{Int}`; index back into the `PointCloud` to materialize a subset.
+
 ```julia
-# Statistical outlier removal
-pc_clean = statistical_filter(pc, 10, 2.0)
-
-# Radius-neighbor noise filter
-pc_clean = rnn_filter(pc, 0.05, min_rnn_size=5)
-
-# Low-level ground filtering (index-based)
 coords = coordinates(pc)
-seed_idx = grid_zmin_filter_indices(coords, 1.0)
-ground_local = upward_conic_filter_indices(coords[seed_idx, :], 45.0)
-ground_idx = seed_idx[ground_local]
+
+# Statistical outlier removal (k=6, n_sigma=1.0)
+indices = statistical_filter(coords, 6, 1.0)
+pc_clean = pc[indices]
+
+# Voxel connected-component filter — drop isolated voxel clusters
+indices = voxel_connected_component_filter(coords, 0.1; min_cc_size=10)
+pc_clean = pc[indices]
+
+# Composing the ground filter chain (grid z-min → upward conic)
+seed_idx     = grid_zmin_filter(coords, 1.0)
+ground_local = upward_conic_filter(coords[seed_idx, :], 45.0)
+ground_idx   = seed_idx[ground_local]
 nonground_idx = sort(setdiff(1:npoints(pc), ground_idx))
 ```
 
@@ -129,34 +139,76 @@ pc_cropped = bounding_box_crop(pc, [0, 0, 0], [10, 10, 10])
 ### Ground Segmentation
 
 ```julia
-# Two-stage ground segmentation + above-ground height
+# Ground segmentation + above-ground height (AGH) interpolation
 result = ground_segmentation(pc)
-# result.ground_points  — ground point cloud
-# result.agh_cloud      — input cloud with :AGH attribute added
-# result.ground_area    — area of ground polygon (m²)
-
-# Or use the lower-level API
-ground_pc = segment_ground(pc, grid_size=1.0, cone_theta_deg=45.0)
-agh = calculate_aboveground_height(pc, ground_pc, xy_resolution=0.5)
+# result.ground_points       — ground point cloud
+# result.aboveground_height  — per-point AGH (Vector{Float64})
+# result.agh_cloud           — input cloud with :AGH attribute added
+# result.ground_area         — area of ground polygon (m²)
+# result.agh_computed        — Bool: whether AGH was actually computed
 ```
+
+Lower-level helpers `segment_ground` and `calculate_aboveground_height` are
+also exported for custom pipelines.
 
 ### Tree Segmentation
 
 ```julia
 # Requires :AGH attribute (from ground_segmentation)
-result_pc = tree_segmentation(result.agh_cloud)
-# Returns PointCloud with :tree_id and :segment_id attributes
+tree_result = tree_segmentation(result.agh_cloud)
+# tree_result.pc_output       — input cloud annotated with :tree_id,
+#                               :tree_nbs_id, :nbs_id, :node_id, :AGH
+# tree_result.filtered_cloud  — near-ground / above-AGH-threshold subset used internally
+# tree_result.skeleton_cloud  — proto-node skeleton point cloud
+# tree_result.n_components    — number of connected components
+# tree_result.neighbor_radius — radius used for the radius-neighbor graph
 
-# Create skeleton point cloud from segmentation result
-skeleton_pc = create_skeleton_cloud(result_pc)
+# Create a per-NBS skeleton point cloud
+skeleton_pc = create_skeleton_cloud(tree_result.pc_output)
+```
+
+### QSM (Quantitative Structural Modeling)
+
+```julia
+# Fits per-branch cross-sections and aggregates to per-tree biometrics.
+# Requires a tree-segmented point cloud (output of tree_segmentation).
+qsm_result = qsm(
+    tree_result   = tree_result,
+    output_dir    = "out/",
+    output_prefix = "demo_",
+)
+# qsm_result.pc_output         — input cloud annotated with :qsm_node_id
+# qsm_result.qsm_surface_cloud — generated surface points with :tree_nbs_id, :rho
+# qsm_result.node_csv_path     — per-node biometrics (DBH, cross-section area, volume)
+# qsm_result.tree_csv_path     — per-tree aggregates (height, DBH, volume, surface area)
 ```
 
 ### Pipeline
 
+`run_pipeline(config_path)` loads a TOML configuration and runs every enabled
+stage in execution order (preprocess → ground segmentation → AGH → tree
+segmentation → QSM), writing intermediate clouds and CSV outputs to
+`pipeline.output_dir`. With no argument, it uses the package-default
+`flip_config.toml` at the repo root.
+
 ```julia
-# Run the full processing pipeline from a TOML config file
 run_pipeline("my_config.toml")
 ```
+
+The config file mirrors the `FLiPConfig` struct one-to-one. A minimal example:
+
+```toml
+[pipeline]
+input_path = "input.laz"
+output_dir = "out/"
+enable_qsm = true
+
+[qsm]
+min_node_size  = 5
+rho_percentile = 0.85
+```
+
+See [`flip_config.toml`](flip_config.toml) for the full annotated template.
 
 ## Data Structure
 
@@ -200,7 +252,7 @@ FLiP.jl is designed for high performance on large point clouds:
 - [MultivariateStats.jl](https://github.com/JuliaStats/MultivariateStats.jl) - PCA for linearity analysis
 - [CoordinateTransformations.jl](https://github.com/JuliaGeometry/CoordinateTransformations.jl) / [Rotations.jl](https://github.com/JuliaGeometry/Rotations.jl) - Geometric transformations
 - [StaticArrays.jl](https://github.com/JuliaArrays/StaticArrays.jl) - Efficient fixed-size arrays
-- [PythonCall.jl](https://github.com/JuliaPy/PythonCall.jl) + CondaPkg - LAS/LAZ I/O via laspy, E57 I/O via pye57
+- [PythonCall.jl](https://github.com/JuliaPy/PythonCall.jl) + CondaPkg — auto-managed Python env for LAS/LAZ I/O (`laspy` + `lazrs`) and E57 I/O (`pye57`)
 
 ## Contributing
 
