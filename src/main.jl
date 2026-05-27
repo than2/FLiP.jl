@@ -11,6 +11,7 @@ Run FLiP main pipeline stages in order:
 """
 function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     cfg = _stage_initialization(config_path)
+    _log_session_info(cfg)
 
     pp_output = _stage_preprocess(cfg)
     g_output  = _stage_ground(cfg, pp_output.cloud);    pp_output = _drop_preprocess_clouds(pp_output)

@@ -33,6 +33,37 @@ function _fmt_elapsed(dt::Real)
     return string(Int(m), "m ", Int(round(s)), "s")
 end
 
+# ── Byte formatting ───────────────────────────────────────────────────────
+
+"""
+    _fmt_bytes(n::Integer) -> String
+
+Format a byte count as GiB with one decimal, e.g. `"64.0 GiB"`.
+"""
+function _fmt_bytes(n::Integer)
+    return string(round(n / 2^30, digits=1), " GiB")
+end
+
+# ── Session resource banner ───────────────────────────────────────────────
+
+"""
+    _log_session_info(cfg)
+
+Emit a two-line `@info` summary of the host resources and thread budget for this
+run. The first line reports CPU cores and RAM (free / total). The second line
+makes the three distinct thread quantities explicit:
+
+- `Threads.nthreads()` — threads available to Julia (launch-time `-t` / `JULIA_NUM_THREADS` cap).
+- `cfg.pipeline.n_thread` — the raw value requested in the config.
+- `effective_nthreads(cfg)` — the resolved budget actually used (capped at the above).
+"""
+function _log_session_info(cfg)
+    @info "$_LOG_PREFIX session: $(Sys.CPU_THREADS) CPU cores, " *
+          "$(_fmt_bytes(Sys.free_memory())) free / $(_fmt_bytes(Sys.total_memory())) total RAM"
+    @info "$_LOG_PREFIX threads: $(Threads.nthreads()) available to Julia, " *
+          "config n_thread=$(cfg.pipeline.n_thread), using $(effective_nthreads(cfg))"
+end
+
 # ── Stage timing wrappers ─────────────────────────────────────────────────
 
 """
