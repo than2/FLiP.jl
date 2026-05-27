@@ -118,9 +118,19 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     node_offset        = Int32(0)
     tree_offset        = Int32(0)
 
+    # Per-CC progress throttle: emit @info only when crossing a 5% boundary on
+    # cumulative processed points (mirrors label_non_branching_segments).
+    last_pct_report = -5
+    processed_points = 0
+
     for (ci, cc_indices) in enumerate(cc_indices_by_id)
         cc_n = length(cc_indices)
-        @info "[tree_segmentation]   component $ci/$n_components: $cc_n points"
+        processed_points += cc_n
+        pct = round(Int, 100.0 * processed_points / N)
+        if pct >= last_pct_report + 5
+            last_pct_report = pct - (pct % 5)
+            @info "[tree_segmentation] component progress" pct=last_pct_report component="$ci/$n_components" cumulative_points=processed_points
+        end
 
         cc_coords = coords_filtered[cc_indices, :]
         cc_agh    = agh_filtered[cc_indices]
@@ -166,7 +176,8 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
         merged_skel       = PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}())
         merged_skel_graph = SimpleGraph{Int}(0)
     else
-        merged_skel       = merge_pointclouds(all_skel_coords, all_skel_attrs)
+        merged_skel       = merge_pointclouds(all_skel_coords, all_skel_attrs;
+                                              verbose=cfg.pipeline.enable_debug_info)
         merged_skel_graph = SimpleGraph{Int}(skel_vertex_offset)
         for (u, v) in all_skel_edges
             add_edge!(merged_skel_graph, u, v)
@@ -352,7 +363,7 @@ function label_non_branching_segments(
         pct = round(Int, 100.0 * n_labeled_total / N)
         if pct >= last_pct_report + 5
             last_pct_report = pct - (pct % 5)
-            @info "NBS labeling progress" pct=last_pct_report nbs_count=next_id-1 elapsed_s=round(time()-t_nbs_start, digits=1)
+            cfg.pipeline.enable_debug_info && @info "NBS labeling progress" pct=last_pct_report nbs_count=next_id-1 elapsed_s=round(time()-t_nbs_start, digits=1)
         end
     end
 
@@ -595,7 +606,7 @@ function assemble_segments(
     assigned_nbs = seed_res.assigned_nbs   # BitVector
     next_tree_id = seed_res.next_tree_id
 
-    @info "Assembly: seeded $(next_tree_id - 1) trees from near-ground NBS"
+    cfg.pipeline.enable_debug_info && @info "Assembly: seeded $(next_tree_id - 1) trees from near-ground NBS"
 
     # ── Step 4.1b: optional fallback seed for ground-disconnected CCs ────
     # If this connected component contains no near-ground NBS, the iterative
@@ -605,7 +616,7 @@ function assemble_segments(
     # through it deterministically.
     if cfg.tree_segmentation.resolve_isolated_branches && next_tree_id == Int32(1)
         assigned_tid = _seed_largest_nbs!(tree_id, nbs_tree, assigned_nbs,
-                                          nbs_points, next_tree_id)
+                                          nbs_points, next_tree_id; cfg=cfg)
         if assigned_tid > 0
             next_tree_id += Int32(1)
         end
@@ -614,7 +625,8 @@ function assemble_segments(
     # ── Step 4.2: iterative growth via skeleton graph ────────────
     iteration = _iterative_tree_growth!(tree_id, tree_nbs_id, nbs_tree, assigned_nbs,
                                         K_nbs, nbs_points, nbs_skel_nodes, skel_to_nbs,
-                                        nbs_adj, graph_skeleton, Float64(merge_threshold))
+                                        nbs_adj, graph_skeleton, Float64(merge_threshold);
+                                        cfg=cfg)
 
     # ── Step 4.3: re-order tree_nbs_id by descending group size ──────
     # Within this assemble_segments call, every non-zero tree_nbs_id value belongs
@@ -629,7 +641,7 @@ function assemble_segments(
 
     n_trees = length(unique(tid for tid in tree_id if tid > 0))
     n_assigned_pts = count(>(Int32(0)), tree_id)
-    @info "Assembly complete" n_trees n_assigned_points=n_assigned_pts total_points=N iterations=iteration
+    cfg.pipeline.enable_debug_info && @info "Assembly complete" n_trees n_assigned_points=n_assigned_pts total_points=N iterations=iteration
 
     return (tree_nbs_id = tree_nbs_id, tree_id = tree_id)
 end
@@ -753,7 +765,7 @@ end
 
 """
     _seed_largest_nbs!(tree_id, nbs_tree, assigned_nbs, nbs_points,
-                       next_tree_id) -> Int32
+                       next_tree_id; cfg=_CFG) -> Int32
 
 Find the single largest NBS by `length(nbs_points[k])` and seed it with
 `next_tree_id`. Mutates `tree_id`, `nbs_tree`, `assigned_nbs` in place.
@@ -771,7 +783,8 @@ function _seed_largest_nbs!(tree_id::AbstractVector{Int32},
                             nbs_tree::Vector{Int32},
                             assigned_nbs::BitVector,
                             nbs_points::Vector{Vector{Int}},
-                            next_tree_id::Int32)
+                            next_tree_id::Int32;
+                            cfg::FLiPConfig=_CFG)
     K_nbs  = length(nbs_points)
     best_k = 0
     best_n = 0
@@ -789,7 +802,7 @@ function _seed_largest_nbs!(tree_id::AbstractVector{Int32},
     @inbounds for i in nbs_points[best_k]
         tree_id[i] = next_tree_id
     end
-    @info "Assembly: resolve_isolated_branches — seeded NBS $best_k ($best_n points) as tree $next_tree_id (no near-ground seed in this CC)"
+    cfg.pipeline.enable_debug_info && @info "Assembly: resolve_isolated_branches — seeded NBS $best_k ($best_n points) as tree $next_tree_id (no near-ground seed in this CC)"
     return next_tree_id
 end
 
@@ -832,7 +845,7 @@ end
 """
     _iterative_tree_growth!(tree_id, tree_nbs_id, nbs_tree, assigned_nbs,
                             K_nbs, nbs_points, nbs_skel_nodes, skel_to_nbs,
-                            nbs_adj, graph_skeleton, merge_threshold) -> Int
+                            nbs_adj, graph_skeleton, merge_threshold; cfg=_CFG) -> Int
 
 Iteratively grow trees from the currently-seeded NBS outward through the
 skeleton graph. `assigned_nbs[k] == true` marks the seed set on entry; the
@@ -867,7 +880,8 @@ function _iterative_tree_growth!(tree_id::AbstractVector{Int32},
                                  skel_to_nbs::Vector{Int},
                                  nbs_adj::SparseMatrixCSC{Int,Int},
                                  graph_skeleton::SimpleGraph{Int},
-                                 merge_threshold::Float64)
+                                 merge_threshold::Float64;
+                                 cfg::FLiPConfig=_CFG)
     # `frontier_info` is built once and maintained INCREMENTALLY: each time an NBS
     # transitions to assigned we add its contributions to its unassigned skeleton
     # neighbors and remove it from the frontier set. Updates from within an iteration
@@ -979,7 +993,7 @@ function _iterative_tree_growth!(tree_id::AbstractVector{Int32},
 
         n_assigned_this_round == 0 && break
 
-        @info "Assembly iteration $iteration: assigned $n_assigned_this_round NBS" total_assigned=count(assigned_nbs)
+        cfg.pipeline.enable_debug_info && @info "Assembly iteration $iteration: assigned $n_assigned_this_round NBS" total_assigned=count(assigned_nbs)
     end
 
     return iteration
@@ -1119,7 +1133,7 @@ function process_orphan_segments(
     end
 
     # ── Source 1: radius graph among orphan points ───────────────
-    @info "[tree_segmentation] orphan rescue: building radius graph for $n_orphan_pts orphan points (r=$occlusion_tol m)"
+    cfg.pipeline.enable_debug_info && @info "[tree_segmentation] orphan rescue: building radius graph for $n_orphan_pts orphan points (r=$occlusion_tol m)"
     orphan_coords = coords[orphan_pt_idx, :]
     orphan_graph  = build_radius_graph(orphan_coords, occlusion_tol; weights=false).graph
 
@@ -1161,7 +1175,7 @@ function process_orphan_segments(
             assigned_3xM[3, j] = coords[i, 3]
         end
         kdtree = KDTree(assigned_3xM)
-        @info "[tree_segmentation] orphan rescue: KDTree query for orphan→tree connections"
+        cfg.pipeline.enable_debug_info && @info "[tree_segmentation] orphan rescue: KDTree query for orphan→tree connections"
 
         # Single pass populates coarse_o2t, orphan_to_tree_nbs_v, and the
         # `orphan_conn_nodes` set used by the node-based frac_connected metric.
@@ -1204,7 +1218,7 @@ function process_orphan_segments(
     empty!(orphan_idx_of_nbs)
 
     # ── Iterative propagation on coarse graph ─────────────────────
-    orphan_tree_id = _propagate_orphan_labels(coarse_o2o, coarse_o2t, orphan_nbs_points)
+    orphan_tree_id = _propagate_orphan_labels(coarse_o2o, coarse_o2t, orphan_nbs_points; cfg=cfg)
 
     # ── Apply orphan assignments ─────────────────────────────────
     # `next_fresh_tnbs` allocates globally-unique labels for orphans that take
@@ -1251,13 +1265,14 @@ function process_orphan_segments(
             n_rule_b += 1
         end
     end
-    @info "[tree_segmentation] orphan rescue apply: Rule A=$n_rule_a (new tnid), Rule B=$n_rule_b (merged tnid), threshold=$merge_threshold"
+    cfg.pipeline.enable_debug_info && @info "[tree_segmentation] orphan rescue apply: Rule A=$n_rule_a (new tnid), Rule B=$n_rule_b (merged tnid), threshold=$merge_threshold"
 
     return nothing
 end
 
 """
-    _propagate_orphan_labels(coarse_o2o, coarse_o2t, orphan_nbs_points) -> Vector{Int32}
+    _propagate_orphan_labels(coarse_o2o, coarse_o2t, orphan_nbs_points; cfg=_CFG)
+        -> Vector{Int32}
 
 Run the iterative tree-id propagation on the coarse orphan graph. At each
 iteration every still-unassigned orphan votes by summing connections to
@@ -1270,7 +1285,8 @@ tree id for orphan index `i` (0 = never rescued).
 """
 function _propagate_orphan_labels(coarse_o2o::Vector{Dict{Int,Int}},
                                   coarse_o2t::Vector{Dict{Int32,Int}},
-                                  orphan_nbs_points::Vector{Vector{Int}})
+                                  orphan_nbs_points::Vector{Vector{Int}};
+                                  cfg::FLiPConfig=_CFG)
     K_orphan = length(coarse_o2o)
     orphan_tree_id  = zeros(Int32, K_orphan)
     orphan_assigned = falses(K_orphan)
@@ -1318,7 +1334,7 @@ function _propagate_orphan_labels(coarse_o2o::Vector{Dict{Int,Int}},
             n_rescued += 1
         end
         n_rescued == 0 && break
-        @info "[tree_segmentation] orphan rescue iteration $iteration: rescued $n_rescued NBS"
+        cfg.pipeline.enable_debug_info && @info "[tree_segmentation] orphan rescue iteration $iteration: rescued $n_rescued NBS"
     end
     return orphan_tree_id
 end

@@ -89,7 +89,8 @@ dropped). With a single-element list, returns a PointCloud built from that
 element without any concatenation.
 """
 function merge_pointclouds(coords_list::AbstractVector{<:AbstractMatrix},
-                           attrs_list::AbstractVector{<:Dict{Symbol,<:Vector}})
+                           attrs_list::AbstractVector{<:Dict{Symbol,<:Vector}};
+                           verbose::Bool=true)
     length(coords_list) == length(attrs_list) ||
         throw(ArgumentError("coords_list and attrs_list must have the same length"))
     isempty(coords_list) && throw(ArgumentError("cannot merge an empty list"))
@@ -105,7 +106,7 @@ function merge_pointclouds(coords_list::AbstractVector{<:AbstractMatrix},
         union!(all_keys, keys(a))
     end
     dropped = setdiff(all_keys, common_keys)
-    isempty(dropped) ||
+    (isempty(dropped) || !verbose) ||
         @info "merge_pointclouds: dropping attributes missing from some scans: $(sort(collect(dropped); by=string))"
     merged_attrs = Dict{Symbol,Vector}()
     for k in common_keys

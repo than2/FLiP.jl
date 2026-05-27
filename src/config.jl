@@ -126,6 +126,9 @@ mutable struct PipelineCfg
     enable_tree_segmentation::Bool
     enable_qsm::Bool
     enable_generate_report::Bool
+
+    # Logging
+    enable_debug_info::Bool
 end
 PipelineCfg(d::Dict) = PipelineCfg(
     String(get(d, "input_path",    "")),
@@ -148,6 +151,7 @@ PipelineCfg(d::Dict) = PipelineCfg(
     Bool(get(d, "enable_tree_segmentation",   true)),
     Bool(get(d, "enable_qsm",                 true)),
     Bool(get(d, "enable_generate_report",     true)),
+    Bool(get(d, "enable_debug_info",          false)),
 )
 
 # ── Top-level wrapper ────────────────────────────────────────────────────────

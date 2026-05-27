@@ -39,6 +39,9 @@ enable_tree_segmentation   = true     # Stage 3: per-tree clustering
 enable_qsm                 = true     # Stage 4: quantitative structural modeling
 enable_generate_report     = true     # Optional summary report (currently placeholder)
 
+# --- Logging ---
+enable_debug_info = false             # If true, show low-level helper @info logs (assembly iteration, orphan rescue, etc.); default false silences them
+
 # --- AGH interpolation (only used if enable_agh = true) ---
 xy_resolution = 0.05                  # Grid cell size (m) for IDW interpolation
 idw_k         = 8                     # Number of nearest neighbors
