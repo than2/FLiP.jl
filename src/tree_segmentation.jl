@@ -100,7 +100,7 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     cc_labels = Int[]   # free per-point label vector (~ 8N bytes)
 
     n_components = K_cc
-    @info "[tree_segmentation] $N filtered points → $n_components connected components" min_cc=cfg.tree_segmentation.min_nbs_size
+    @info "$_LOG_PREFIX   $N filtered points → $n_components connected components (min_cc=$(cfg.tree_segmentation.min_nbs_size))"
 
     n_components == 0 && return empty_result
 
@@ -118,19 +118,14 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     node_offset        = Int32(0)
     tree_offset        = Int32(0)
 
-    # Per-CC progress throttle: emit @info only when crossing a 5% boundary on
-    # cumulative processed points (mirrors label_non_branching_segments).
-    last_pct_report = -5
+    # Per-CC progress reported as % of cumulative points processed. The reporter
+    # is thread-safe (atomic CAS), so a future `Threads.@threads` adoption only
+    # needs a shared atomic counter for `processed_points`.
+    progress = ProgressReporter("processing components", N)
     processed_points = 0
 
     for (ci, cc_indices) in enumerate(cc_indices_by_id)
         cc_n = length(cc_indices)
-        processed_points += cc_n
-        pct = round(Int, 100.0 * processed_points / N)
-        if pct >= last_pct_report + 5
-            last_pct_report = pct - (pct % 5)
-            @info "[tree_segmentation] component progress" pct=last_pct_report component="$ci/$n_components" cumulative_points=processed_points
-        end
 
         cc_coords = coords_filtered[cc_indices, :]
         cc_agh    = agh_filtered[cc_indices]
@@ -167,6 +162,9 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
         nbs_offset  += local_nbs_max
         node_offset += local_node_max
         tree_offset += local_tree_max
+
+        processed_points += cc_n
+        report!(progress, processed_points; extra="$ci/$n_components")
     end
 
     empty!(cc_indices_by_id)   # release after per-component loop
@@ -204,10 +202,10 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
         obj_path = joinpath(expanduser(cfg.pipeline.output_dir),
                             "$(cfg.pipeline.output_prefix)skeleton_graph.obj")
         _write_polyline_obj(obj_path, coordinates(merged_skel), merged_skel_graph)
-        @info "[tree_segmentation] wrote: $obj_path"
+        @info "$_LOG_PREFIX   wrote: $obj_path"
     end
 
-    @info "[tree_segmentation] done" n_components=n_components n_trees=tree_offset n_nbs=nbs_offset
+    @info "$_LOG_PREFIX   n_components=$n_components, n_trees=$tree_offset, n_nbs=$nbs_offset"
 
     return (
         filtered_cloud  = pc_filtered,
@@ -298,8 +296,9 @@ function label_non_branching_segments(
     next_id          = 1
     next_global_node = 1
     n_labeled_total  = count(!, unlabeled_mask)   # already labeled (discarded small CCs)
-    last_pct_report  = 0
-    t_nbs_start      = time()
+    # Debug-gated progress: only constructed (and only logged) when the flag is on.
+    nbs_progress = cfg.pipeline.enable_debug_info ?
+                   ProgressReporter("NBS labeling", N) : nothing
 
     while true
         seed_clusters = _find_seed_clusters(
@@ -360,11 +359,7 @@ function label_non_branching_segments(
             n_labeled_total += n_labeled
         end
 
-        pct = round(Int, 100.0 * n_labeled_total / N)
-        if pct >= last_pct_report + 5
-            last_pct_report = pct - (pct % 5)
-            cfg.pipeline.enable_debug_info && @info "NBS labeling progress" pct=last_pct_report nbs_count=next_id-1 elapsed_s=round(time()-t_nbs_start, digits=1)
-        end
+        nbs_progress !== nothing && report!(nbs_progress, n_labeled_total; extra="nbs=$(next_id-1)")
     end
 
     # Relabel valid segments by descending size; -1 (discarded) and 0 (unprocessed)

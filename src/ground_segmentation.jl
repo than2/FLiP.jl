@@ -27,6 +27,7 @@ function ground_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
         cone_theta_deg=cfg.segment_ground.cone_theta_deg,
         voxel_size=cfg.segment_ground.voxel_size,
         min_cc_size=cfg.segment_ground.min_cc_size,
+        verbose=cfg.pipeline.enable_debug_info,
     )
 
     ground_area = 0.0
@@ -39,7 +40,7 @@ function ground_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
             n_sigma=cfg.statistical_filter.n_sigma)
         pc_use = crop_res.pc_cropped
         ground_area = crop_res.ground_area
-        @info "Ground polygon crop: $(npoints(pc)) → $(npoints(pc_use)) points, ground area = $(round(ground_area; digits=2)) m²"
+        @info "$_LOG_PREFIX   polygon crop: $(npoints(pc)) → $(npoints(pc_use)) points, ground area = $(round(ground_area; digits=2)) m²"
     end
 
     if cfg.pipeline.enable_agh
@@ -79,16 +80,21 @@ function segment_ground(pc::PointCloud;
                         grid_size::Real=_CFG.segment_ground.grid_size,
                         cone_theta_deg::Real=_CFG.segment_ground.cone_theta_deg,
                         voxel_size::Real=_CFG.segment_ground.voxel_size,
-                        min_cc_size::Int=_CFG.segment_ground.min_cc_size)
+                        min_cc_size::Int=_CFG.segment_ground.min_cc_size,
+                        verbose::Bool=false)
     coords = coordinates(pc)
+    n0 = size(coords, 1)
 
     idx1 = voxel_connected_component_filter(coords, voxel_size, min_cc_size=min_cc_size)
+    verbose && @info "$_LOG_PREFIX     voxel CC pre-filter: $n0 → $(length(idx1)) points"
     # @view avoids materializing intermediate copies of `coords`; for a 50M-point
     # cloud at Float64 each copy would be ≈ 1.2 GB.
     idx2_local = grid_zmin_filter(@view(coords[idx1, :]), grid_size)
     idx2 = idx1[idx2_local]
+    verbose && @info "$_LOG_PREFIX     grid z-min filter: → $(length(idx2)) seeds"
     idx3_local = upward_conic_filter(@view(coords[idx2, :]), cone_theta_deg)
     idx_final = idx2[idx3_local]
+    verbose && @info "$_LOG_PREFIX     upward conic filter: → $(length(idx_final)) ground points"
     return pc[idx_final]
 end
 

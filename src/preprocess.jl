@@ -29,8 +29,18 @@ function preprocess(; cfg::FLiPConfig=_CFG)
     T = coord_type(cfg)
     last_pc::Union{PointCloud{T}, Nothing} = nothing
 
+    # For batches over a handful of files, use a throttled progress reporter
+    # on file count; per-file lines stay debug-gated. For 1–5 files, print
+    # each one (still concise) and skip the reporter.
+    use_progress = n_files > 5
+    progress = use_progress ? ProgressReporter("reading files", n_files) : nothing
+
     for (i, fpath) in enumerate(input_files)
-        @info "[preprocess] Reading file $i/$n_files: $fpath"
+        if use_progress
+            cfg.pipeline.enable_debug_info && @info "$_LOG_PREFIX     reading file $i/$n_files: $fpath"
+        else
+            @info "$_LOG_PREFIX   reading file $i/$n_files: $fpath"
+        end
         ext = lowercase(splitext(fpath)[2])
 
         if ext == ".e57" && cfg.pipeline.enable_preprocess
@@ -39,7 +49,7 @@ function preprocess(; cfg::FLiPConfig=_CFG)
             # (Previously only triggered when subsample was also enabled, which
             # left stat-filter-only E57 inputs on the full-cloud path.)
             coords, attrs = _read_e57_to_raw(fpath; precision=T)
-            @info "[preprocess]   raw points: $(size(coords, 1))"
+            cfg.pipeline.enable_debug_info && @info "$_LOG_PREFIX     raw points: $(size(coords, 1))"
             coords, attrs = _apply_preprocess_filters(coords, attrs; cfg=cfg)
             pc = PointCloud(coords, attrs)
         else
@@ -55,7 +65,12 @@ function preprocess(; cfg::FLiPConfig=_CFG)
         suffix = n_files > 1 ? "_S$(i)" : ""
         out_path = joinpath(output_dir, "$(output_prefix)preprocess$(suffix).$(output_fmt)")
         write_pc(out_path, pc)
-        @info "[preprocess] Wrote: $out_path  ($(npoints(pc)) points)"
+        if use_progress
+            cfg.pipeline.enable_debug_info && @info "$_LOG_PREFIX     wrote: $out_path ($(npoints(pc)) points)"
+            report!(progress, i)
+        else
+            @info "$_LOG_PREFIX   wrote: $out_path ($(npoints(pc)) points)"
+        end
 
         # Single-file: hold the cloud in memory and return it directly.
         # Multi-file: rely on the on-disk per-scan files; downstream reloads
@@ -66,7 +81,7 @@ function preprocess(; cfg::FLiPConfig=_CFG)
     end
 
     if n_files > 1
-        @info "[preprocess] Wrote $n_files scan files; downstream stages will lazy-merge from disk"
+        @info "$_LOG_PREFIX   wrote $n_files scan files; downstream stages will lazy-merge from disk"
     end
     return last_pc
 end

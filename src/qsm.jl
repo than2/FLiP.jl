@@ -99,7 +99,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     cfg = isempty(config_path) ? _CFG : load_config!(String(config_path))
 
     if isnothing(tree_result) || npoints(tree_result.pc_output) == 0
-        @warn "[qsm] No tree segmentation data available"
+        @warn "$_LOG_PREFIX qsm: no tree segmentation data available"
         return (status=:no_data, n_nodes=0, n_trees=0,
                 node_csv_path="", tree_csv_path="", pc_output=nothing)
     end
@@ -113,12 +113,12 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     tree_nbs_ids = hasattribute(pc, :tree_nbs_id) ? getattribute(pc, :tree_nbs_id) : zeros(Int32, N)
     agh_values = hasattribute(pc, :AGH) ? getattribute(pc, :AGH) : zeros(Float64, N)
 
-    @info "[qsm] processing point cloud" n_points=N
+    @info "$_LOG_PREFIX   processing $N points"
 
     # Stage 1: Filter linear NBS segments
     linear_nbs = _filter_linear_nbs(coords, tree_nbs_ids, cfg)
     n_linear = count(!isnothing, linear_nbs)
-    @info "[qsm] linear NBS filter" n_linear linearity_threshold=cfg.qsm.nbs_linearity_threshold
+    @info "$_LOG_PREFIX   $n_linear linear NBS (linearity_threshold=$(cfg.qsm.nbs_linearity_threshold))"
 
     if n_linear == 0
         setattribute!(pc, :qsm_node_id, zeros(Int32, N))
@@ -136,6 +136,11 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     surface_nbs_parts = Vector{Int32}[]
     surface_rho_parts = Vector{Float64}[]
 
+    # Per-NBS progress (counted over all linear_nbs slots; reporter handles
+    # the throttle and is thread-safe for future Threads.@threads adoption).
+    nbs_progress = ProgressReporter("processing NBS", n_linear)
+    n_done = 0
+
     for nid in 1:length(linear_nbs)
         info = linear_nbs[nid]
         info === nothing && continue
@@ -150,9 +155,12 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
             push!(surface_nbs_parts, fill(nid32, size(surf_pts, 1)))
             push!(surface_rho_parts, surf_rho)
         end
+
+        n_done += 1
+        report!(nbs_progress, n_done)
     end
 
-    @info "[qsm] QSM node creation" n_nodes=length(nodes)
+    @info "$_LOG_PREFIX   $(length(nodes)) QSM nodes created"
 
     # Stage 3: Build output tables and write CSV / surface cloud
     node_columns, node_headers, vol, sa = _build_node_table(nodes)
@@ -160,7 +168,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
 
     n_nodes_out = isempty(node_columns) ? 0 : length(first(node_columns))
     n_trees     = isempty(tree_columns) ? 0 : length(first(tree_columns))
-    @info "[qsm] tree aggregation" n_trees
+    @info "$_LOG_PREFIX   aggregated to $n_trees trees"
 
     node_csv = joinpath(output_dir, "$(output_prefix)qsm_nodes.csv")
     tree_csv = joinpath(output_dir, "$(output_prefix)qsm_trees.csv")
@@ -169,11 +177,11 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
         mkpath(output_dir)
         if n_nodes_out > 0
             _write_csv(node_csv, node_columns, node_headers)
-            @info "[qsm] wrote node biometrics" path=node_csv
+            @info "$_LOG_PREFIX   wrote node biometrics: $node_csv"
         end
         if n_trees > 0
             _write_csv(tree_csv, tree_columns, tree_headers)
-            @info "[qsm] wrote tree biometrics" path=tree_csv
+            @info "$_LOG_PREFIX   wrote tree biometrics: $tree_csv"
         end
     end
 
@@ -184,21 +192,21 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
         surf_nbs = vcat(surface_nbs_parts...)
         surf_rho = vcat(surface_rho_parts...)
         qsm_surface_cloud = PointCloud(surf_coords, Dict{Symbol,Vector}(:tree_nbs_id => surf_nbs, :rho => surf_rho))
-        @info "[qsm] generated QSM surface cloud" n_points=npoints(qsm_surface_cloud)
+        cfg.pipeline.enable_debug_info && @info "$_LOG_PREFIX     generated QSM surface cloud ($(npoints(qsm_surface_cloud)) points)"
     else
         qsm_surface_cloud = PointCloud(Matrix{Float64}(undef, 0, 3), Dict{Symbol,Vector}())
     end
 
     if !isempty(output_dir) && npoints(qsm_surface_cloud) > 0
         write_pc(surf_cloud_path, qsm_surface_cloud)
-        @info "[qsm] wrote QSM surface cloud" path=surf_cloud_path
+        @info "$_LOG_PREFIX   wrote QSM surface cloud: $surf_cloud_path"
     end
 
     # Add QSM node IDs to point cloud and overwrite tree cloud on disk
     setattribute!(pc, :qsm_node_id, qsm_node_ids)
     if !isempty(tree_cloud_path)
         write_pc(tree_cloud_path, pc)
-        @info "[qsm] overwrote tree cloud with qsm_node_id" path=tree_cloud_path
+        cfg.pipeline.enable_debug_info && @info "$_LOG_PREFIX     overwrote tree cloud with qsm_node_id: $tree_cloud_path"
     end
 
     return (

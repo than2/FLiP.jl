@@ -48,6 +48,7 @@ using Rotations
 # Include submodules
 include("pointcloud.jl")
 include("config.jl")
+include("util/logging.jl")
 include("io.jl")
 include("util/array_utils.jl")
 include("util/geometry_utils.jl")

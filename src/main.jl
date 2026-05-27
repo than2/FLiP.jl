@@ -67,11 +67,13 @@ single-file output path, and whether the stage produced output.
 function _stage_preprocess(cfg::FLiPConfig)
     fmt  = lowercase(cfg.pipeline.output_format)
     path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "preprocess", fmt)
-    if cfg.pipeline.enable_preprocess
-        return (cloud=preprocess(; cfg=cfg), path=path, written=true)
+    if !cfg.pipeline.enable_preprocess
+        _log_stage_skipped("preprocess")
+        return (cloud=nothing, path=path, written=false)
     end
-    @info "[main] preprocess disabled by config"
-    return (cloud=nothing, path=path, written=false)
+    return _with_stage_timing("preprocess") do
+        (cloud=preprocess(; cfg=cfg), path=path, written=true)
+    end
 end
 
 """
@@ -91,28 +93,30 @@ function _stage_ground(cfg::FLiPConfig, pc_preprocess)
     agh_path    = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "agh",    fmt)
 
     if !cfg.pipeline.enable_ground_segmentation
-        @info "[main] ground segmentation disabled by config"
+        _log_stage_skipped("ground_segmentation")
         return (ground=nothing, agh=nothing,
                 ground_path=ground_path, agh_path=agh_path,
                 ground_written=false, agh_written=false,
                 n_preprocess=0, n_ground=0)
     end
 
-    ground_input = _prepare_stage_input(pc_preprocess, cfg, "preprocess",
-                                        "preprocess output", "ground segmentation")
-    res = ground_segmentation(ground_input; cfg=cfg)
+    return _with_stage_timing("ground_segmentation") do
+        ground_input = _prepare_stage_input(pc_preprocess, cfg, "preprocess",
+                                            "preprocess output", "ground segmentation")
+        res = ground_segmentation(ground_input; cfg=cfg)
 
-    write_pc(ground_path, res.ground_points); @info "[main] wrote: $ground_path"
-    agh_written = false
-    if cfg.pipeline.enable_agh
-        write_pc(agh_path, res.agh_cloud); @info "[main] wrote: $agh_path"
-        agh_written = true
+        write_pc(ground_path, res.ground_points); @info "$_LOG_PREFIX   wrote: $ground_path"
+        agh_written = false
+        if cfg.pipeline.enable_agh
+            write_pc(agh_path, res.agh_cloud); @info "$_LOG_PREFIX   wrote: $agh_path"
+            agh_written = true
+        end
+
+        (ground=res.ground_points, agh=res.agh_cloud,
+         ground_path=ground_path, agh_path=agh_path,
+         ground_written=true, agh_written=agh_written,
+         n_preprocess=npoints(res.agh_cloud), n_ground=npoints(res.ground_points))
     end
-
-    return (ground=res.ground_points, agh=res.agh_cloud,
-            ground_path=ground_path, agh_path=agh_path,
-            ground_written=true, agh_written=agh_written,
-            n_preprocess=npoints(res.agh_cloud), n_ground=npoints(res.ground_points))
 end
 
 """
@@ -132,25 +136,27 @@ function _stage_tree(cfg::FLiPConfig, pc_agh)
     skeleton_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "skeleton", fmt)
 
     if !cfg.pipeline.enable_tree_segmentation
-        @info "[main] tree segmentation disabled by config"
+        _log_stage_skipped("tree_segmentation")
         return (result=nothing,
                 tree_path=tree_path, skeleton_path=skeleton_path,
                 tree_written=false, skeleton_written=false,
                 n_components=0)
     end
 
-    tree_input = _prepare_stage_input(pc_agh, cfg, "agh", "AGH output", "tree segmentation")
-    GC.gc()
-    res = tree_segmentation(tree_input; cfg=cfg)
-    tree_input = nothing  # release input
+    return _with_stage_timing("tree_segmentation") do
+        tree_input = _prepare_stage_input(pc_agh, cfg, "agh", "AGH output", "tree segmentation")
+        GC.gc()
+        res = tree_segmentation(tree_input; cfg=cfg)
+        tree_input = nothing  # release input
 
-    write_pc(tree_path,     res.pc_output);      @info "[main] wrote: $tree_path"
-    write_pc(skeleton_path, res.skeleton_cloud); @info "[main] wrote: $skeleton_path"
+        write_pc(tree_path,     res.pc_output);      @info "$_LOG_PREFIX   wrote: $tree_path"
+        write_pc(skeleton_path, res.skeleton_cloud); @info "$_LOG_PREFIX   wrote: $skeleton_path"
 
-    return (result=res,
-            tree_path=tree_path, skeleton_path=skeleton_path,
-            tree_written=true, skeleton_written=true,
-            n_components=res.n_components)
+        (result=res,
+         tree_path=tree_path, skeleton_path=skeleton_path,
+         tree_written=true, skeleton_written=true,
+         n_components=res.n_components)
+    end
 end
 
 """
@@ -161,15 +167,20 @@ Run the QSM stage (or `(status=:skipped,)` if disabled). If `tree_res` is
 via `_load_tree_result`.
 """
 function _stage_qsm(cfg::FLiPConfig, tree_res, config_path::AbstractString)
-    cfg.pipeline.enable_qsm || return (status=:skipped,)
-    tr = isnothing(tree_res) ? _load_tree_result(cfg) : tree_res
-    fmt = lowercase(cfg.pipeline.output_format)
-    tree_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "tree", fmt)
-    return qsm(tree_result=tr,
-               config_path=String(config_path),
-               output_dir=cfg.pipeline.output_dir,
-               output_prefix=cfg.pipeline.output_prefix,
-               tree_cloud_path=tree_path)
+    if !cfg.pipeline.enable_qsm
+        _log_stage_skipped("qsm")
+        return (status=:skipped,)
+    end
+    return _with_stage_timing("qsm") do
+        tr = isnothing(tree_res) ? _load_tree_result(cfg) : tree_res
+        fmt = lowercase(cfg.pipeline.output_format)
+        tree_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "tree", fmt)
+        qsm(tree_result=tr,
+            config_path=String(config_path),
+            output_dir=cfg.pipeline.output_dir,
+            output_prefix=cfg.pipeline.output_prefix,
+            tree_cloud_path=tree_path)
+    end
 end
 
 """
@@ -180,13 +191,18 @@ Run the report stage (or `(status=:skipped,)` if disabled). If `tree_res` is
 from disk via `_load_tree_result`.
 """
 function _stage_report(cfg::FLiPConfig, tree_res, qsm_res, config_path::AbstractString)
-    cfg.pipeline.enable_generate_report || return (status=:skipped,)
-    tr = isnothing(tree_res) ? _load_tree_result(cfg) : tree_res
-    return generate_report(tree_result=tr,
-                           qsm_result=qsm_res,
-                           config_path=String(config_path),
-                           output_dir=cfg.pipeline.output_dir,
-                           output_prefix=cfg.pipeline.output_prefix)
+    if !cfg.pipeline.enable_generate_report
+        _log_stage_skipped("generate_report")
+        return (status=:skipped,)
+    end
+    return _with_stage_timing("generate_report") do
+        tr = isnothing(tree_res) ? _load_tree_result(cfg) : tree_res
+        generate_report(tree_result=tr,
+                        qsm_result=qsm_res,
+                        config_path=String(config_path),
+                        output_dir=cfg.pipeline.output_dir,
+                        output_prefix=cfg.pipeline.output_prefix)
+    end
 end
 
 # ── Resume helpers (used by the stage functions) ──────────────────
@@ -206,24 +222,24 @@ function _prepare_stage_input(data, cfg::FLiPConfig, stem::AbstractString,
     fmt = lowercase(cfg.pipeline.output_format)
     single = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, stem, fmt)
     if isfile(single)
-        @info "[main] resume: loading $single"
+        @info "$_LOG_PREFIX   resume: loading $single"
         return read_pc(single)
     end
 
     scans = find_scan_outputs(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, stem, fmt)
     if !isempty(scans)
-        @info "[main] resume: loading $(length(scans)) $stem files from $(cfg.pipeline.output_dir)"
+        @info "$_LOG_PREFIX   resume: loading $(length(scans)) $stem files from $(cfg.pipeline.output_dir)"
         T = coord_type(cfg)
         all_coords = Vector{Matrix{T}}(undef, length(scans))
         all_attrs  = Vector{Dict{Symbol,Vector}}(undef, length(scans))
         for (i, fpath) in enumerate(scans)
-            @info "[main] resume: loading $fpath"
+            cfg.pipeline.enable_debug_info && @info "$_LOG_PREFIX     resume: loading $fpath"
             pc = read_pc(fpath)
             all_coords[i] = coordinates(pc)
             all_attrs[i]  = _all_attributes(pc)
         end
-        merged = merge_pointclouds(all_coords, all_attrs)
-        length(scans) > 1 && @info "[main] resume: merged $(length(scans)) scans → $(npoints(merged)) points"
+        merged = merge_pointclouds(all_coords, all_attrs; verbose=cfg.pipeline.enable_debug_info)
+        length(scans) > 1 && @info "$_LOG_PREFIX   resume: merged $(length(scans)) scans → $(npoints(merged)) points"
         return merged
     end
 
