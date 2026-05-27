@@ -62,7 +62,7 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     agh = getattribute(pc, :AGH)
 
     # ── Step 1: filter to above-ground points ─────────────────────
-    threshold = cfg.tree_nearground_agh_threshold
+    threshold = cfg.tree_segmentation.nearground_agh_threshold
     nearground_idx = findall(i -> isfinite(float(agh[i])) && float(agh[i]) > threshold,
                              eachindex(agh))
     empty_result = (
@@ -79,14 +79,14 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     agh_filtered    = float.(getattribute(pc_filtered, :AGH))
     N = size(coords_filtered, 1)
 
-    neighbor_radius = cfg.tree_neighbor_radius > 0 ?
-                      cfg.tree_neighbor_radius :
-                      2.0 * cfg.pipeline_subsample_res
+    neighbor_radius = cfg.tree_segmentation.neighbor_radius > 0 ?
+                      cfg.tree_segmentation.neighbor_radius :
+                      2.0 * cfg.pipeline.subsample_res
     neighbor_radius > 0 || throw(ArgumentError("tree neighbor radius must be > 0"))
 
     # ── Step 2: discover components via coordinate-only union-find ──
     cc_labels = connected_component_labels(coords_filtered, neighbor_radius,
-                                           cfg.tree_min_nbs_size)
+                                           cfg.tree_segmentation.min_nbs_size)
 
     # Build component → indices dispatch in one O(N) pass. `connected_component_labels`
     # already ranks valid components as dense 1..K_cc (and 0 for below-min-size), so a
@@ -100,7 +100,7 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     cc_labels = Int[]   # free per-point label vector (~ 8N bytes)
 
     n_components = K_cc
-    @info "[tree_segmentation] $N filtered points → $n_components connected components" min_cc=cfg.tree_min_nbs_size
+    @info "[tree_segmentation] $N filtered points → $n_components connected components" min_cc=cfg.tree_segmentation.min_nbs_size
 
     n_components == 0 && return empty_result
 
@@ -189,9 +189,9 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     setattribute!(pc_filtered, :tree_id,     global_tree_id)
     setattribute!(pc_filtered, :tree_nbs_id, global_tree_nbs_id)
 
-    if !isempty(cfg.pipeline_output_dir)
-        obj_path = joinpath(expanduser(cfg.pipeline_output_dir),
-                            "$(cfg.pipeline_output_prefix)skeleton_graph.obj")
+    if !isempty(cfg.pipeline.output_dir)
+        obj_path = joinpath(expanduser(cfg.pipeline.output_dir),
+                            "$(cfg.pipeline.output_prefix)skeleton_graph.obj")
         _write_polyline_obj(obj_path, coordinates(merged_skel), merged_skel_graph)
         @info "[tree_segmentation] wrote: $obj_path"
     end
@@ -242,7 +242,7 @@ end
     label_non_branching_segments(graph, points, agh_values; cfg) -> NamedTuple
 
 Segment every vertex of `graph` into non-branching segments (NBS) by greedy
-neighborhood expansion. Connected components smaller than `cfg.tree_min_nbs_size`
+neighborhood expansion. Connected components smaller than `cfg.tree_segmentation.min_nbs_size`
 are discarded upfront (label 0). Valid segments are relabeled by descending
 size (largest segment → label 1).
 
@@ -258,9 +258,9 @@ function label_non_branching_segments(
     size(points, 1) == N     || throw(ArgumentError("graph vertex count must match number of points"))
     length(agh_values) == N  || throw(ArgumentError("agh_values length must match graph vertex count"))
 
-    min_segment_size       = cfg.tree_min_nbs_size
-    neighbor_distance      = cfg.tree_nbs_neighbor_distance
-    nearground_agh_ceiling = cfg.tree_nearground_agh_threshold + 2.0 * cfg.pipeline_subsample_res
+    min_segment_size       = cfg.tree_segmentation.min_nbs_size
+    neighbor_distance      = cfg.tree_segmentation.nbs_neighbor_distance
+    nearground_agh_ceiling = cfg.tree_segmentation.nearground_agh_threshold + 2.0 * cfg.pipeline.subsample_res
 
     global_nbs_id  = zeros(Int, N)
     global_node_id = zeros(Int, N)
@@ -319,8 +319,8 @@ function label_non_branching_segments(
                 vertex_mask          = unlabeled_mask,
                 workspace            = gsws,
                 points               = points,
-                linearity_angle_deg  = Float64(cfg.tree_linearity_angle_deg),
-                min_frontier_cc_size = Int(cfg.tree_frontier_min_cc_size),
+                linearity_angle_deg  = Float64(cfg.tree_segmentation.linearity_angle_deg),
+                min_frontier_cc_size = Int(cfg.tree_segmentation.frontier_min_cc_size),
             )
             labeled_idx = result.vertices
             node_ids    = result.node_ids
@@ -571,8 +571,8 @@ function assemble_segments(
 
     # Use the same near-ground ceiling as label_non_branching_segments:
     # threshold + 2× subsample resolution to account for discretisation
-    nearground_ceiling = cfg.tree_nearground_agh_threshold + 2.0 * cfg.pipeline_subsample_res
-    merge_threshold    = cfg.tree_assembly_merge_threshold
+    nearground_ceiling = cfg.tree_segmentation.nearground_agh_threshold + 2.0 * cfg.pipeline.subsample_res
+    merge_threshold    = cfg.tree_segmentation.assembly_merge_threshold
 
     tree_id     = zeros(Int32, N)
     tree_nbs_id = Int32.(copy(nbs_id))
@@ -603,7 +603,7 @@ function assemble_segments(
     # orphan rescue. When `tree_resolve_isolated_branches` is set, we instead
     # seed the largest NBS in the CC as a fresh tree so step 4.2 can grow
     # through it deterministically.
-    if cfg.tree_resolve_isolated_branches && next_tree_id == Int32(1)
+    if cfg.tree_segmentation.resolve_isolated_branches && next_tree_id == Int32(1)
         assigned_tid = _seed_largest_nbs!(tree_id, nbs_tree, assigned_nbs,
                                           nbs_points, next_tree_id)
         if assigned_tid > 0
@@ -1033,7 +1033,7 @@ then iteratively propagates `tree_id` through the coarse graph. The `tree_nbs_id
 assignment for each rescued orphan is gated by the same Rule A / Rule B logic
 as `_iterative_tree_growth!`, using a node-based `frac_connected =
 n_orphan_nodes_with_tree_conn / n_orphan_nodes_total`. When `frac >
-cfg.tree_assembly_merge_threshold` AND a candidate `tree_nbs_id` exists, the
+cfg.tree_segmentation.assembly_merge_threshold` AND a candidate `tree_nbs_id` exists, the
 orphan merges into that existing tnid (Rule B). Otherwise it inherits only the
 winning `tree_id` and is given a fresh `tree_nbs_id` (Rule A), preserving the
 orphan as its own NBS. Mutates `tree_id` and `tree_nbs_id` in place.
@@ -1052,8 +1052,8 @@ function process_orphan_segments(
     cfg::FLiPConfig = _CFG,
 )
     N = size(coords, 1)
-    occlusion_tol   = cfg.tree_assembly_occlusion_tolerance
-    merge_threshold = Float64(cfg.tree_assembly_merge_threshold)
+    occlusion_tol   = cfg.tree_segmentation.assembly_occlusion_tolerance
+    merge_threshold = Float64(cfg.tree_segmentation.assembly_merge_threshold)
     occlusion_tol > 0 || return nothing
 
     K_nbs_global = Int(maximum(nbs_id; init=0))

@@ -118,7 +118,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     # Stage 1: Filter linear NBS segments
     linear_nbs = _filter_linear_nbs(coords, tree_nbs_ids, cfg)
     n_linear = count(!isnothing, linear_nbs)
-    @info "[qsm] linear NBS filter" n_linear linearity_threshold=cfg.qsm_nbs_linearity_threshold
+    @info "[qsm] linear NBS filter" n_linear linearity_threshold=cfg.qsm.nbs_linearity_threshold
 
     if n_linear == 0
         setattribute!(pc, :qsm_node_id, zeros(Int32, N))
@@ -245,7 +245,7 @@ function _filter_linear_nbs(coords::AbstractMatrix{<:Real},
     @inbounds for nid in 1:K
         indices = nbs_groups[nid]
         isempty(indices) && continue
-        pca = pca_linearity(coords, indices, cfg.qsm_nbs_linearity_threshold)
+        pca = pca_linearity(coords, indices, cfg.qsm.nbs_linearity_threshold)
         pca === nothing && continue
 
         # Orient PC1 by z (tree-stem convention: PC1 from low-z to high-z)
@@ -298,7 +298,7 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
                               agh_values::AbstractVector{<:Real},
                               cfg::FLiPConfig,
                               next_node_id::Int)
-    slice_res = cfg.qsm_slice_height_scalar * cfg.pipeline_subsample_res
+    slice_res = cfg.qsm.slice_height_scalar * cfg.pipeline.subsample_res
 
     # 2a: Slice, fit centers, interpolate, smooth. Per-slice QC inside
     # _slice_and_fit_centers may drop points; `indices` is rebound here to the
@@ -308,8 +308,8 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
     # (both done inside `_finalize_centerline!`). Dropped points keep
     # qsm_node_id = 0 by default.
     centers, slice_point_indices, _, _, pt_slice_ids, e1, e2, indices =
-        _slice_and_fit_centers(coords, info, slice_res, cfg.qsm_min_node_size,
-                               cfg.qsm_min_octant_taubin, cfg)
+        _slice_and_fit_centers(coords, info, slice_res, cfg.qsm.min_node_size,
+                               cfg.qsm.min_octant_taubin, cfg)
 
     # 2b: Unroll points to (rho, phi)
     rho, phi = _unroll_points(coords, indices, centers, pt_slice_ids, e1, e2)
@@ -319,7 +319,7 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
     n_slices = size(centers, 1)
     rho, phi, pt_slice_ids, slice_point_indices, indices =
         _filter_rho_outliers(rho, phi, pt_slice_ids, slice_point_indices, indices,
-                             n_slices, cfg.qsm_rho_percentile)
+                             n_slices, cfg.qsm.rho_percentile)
 
     # All points in an NBS share the same tree_id (tree_segmentation assigns per-NBS),
     # so a single lookup suffices instead of an argmax over a histogram.
@@ -334,7 +334,7 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
     for s in 1:n_slices
         local_js = slice_point_indices[s]
         n_pts = length(local_js)
-        n_pts < cfg.qsm_min_node_size && continue
+        n_pts < cfg.qsm.min_node_size && continue
 
         # Mean AGH for this slice
         mean_agh = 0.0
@@ -347,7 +347,7 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
         ca = spl_results[s].cross_area
         circ = spl_results[s].circumference
         completeness = spl_results[s].completeness
-        completeness < cfg.qsm_completeness_threshold && continue
+        completeness < cfg.qsm.completeness_threshold && continue
 
         push!(nodes, QSMNode(
             next_node_id, nbs_id, dominant_tree, dominant_tree_nbs,
@@ -369,7 +369,7 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
 
     # 2d: Generate surface point cloud from the smoothed 2D surface, emitting
     # the per-point surface radius as an attribute alongside coordinates.
-    gen_res = cfg.pipeline_subsample_res
+    gen_res = cfg.pipeline.subsample_res
     surface_pts, surface_rho = _generate_surface_points(surface_grid, centers, e1, e2, slice_res, gen_res)
 
     return (next_node_id, surface_pts, surface_rho)
@@ -387,8 +387,8 @@ end
 
 Slice an NBS along PC1, run per-slice quality control (largest 3D CC with
 continuity tie-break + 3D statistical outlier removal), then fit a circle
-center per slice. QC is governed by `cfg.qsm_qc_*` fields; when
-`cfg.qsm_qc_enable` is `false` it is a no-op.
+center per slice. QC is governed by `cfg.qsm.qc_*` fields; when
+`cfg.qsm.qc_enable` is `false` it is a no-op.
 
 Returns:
 - `centers_3d` — K×3 fitted centers (NaN-invalid slices interpolated)
@@ -431,12 +431,12 @@ function _slice_and_fit_centers(coords::AbstractMatrix{<:Real}, info::NBSInfo,
     end
 
     # Per-slice QC tuning (resolved once; reuses existing config knobs)
-    qc_enable  = cfg.qsm_qc_enable
-    cc_radius  = QC_CC_RADIUS_SCALAR * cfg.pipeline_subsample_res
-    cc_min     = cfg.qsm_min_node_size
-    cont_ratio = cfg.qsm_qc_continuity_ratio
-    sor_k      = cfg.statistical_filter_k_neighbors
-    sor_ns     = cfg.statistical_filter_n_sigma
+    qc_enable  = cfg.qsm.qc_enable
+    cc_radius  = QC_CC_RADIUS_SCALAR * cfg.pipeline.subsample_res
+    cc_min     = cfg.qsm.min_node_size
+    cont_ratio = cfg.qsm.qc_continuity_ratio
+    sor_k      = cfg.statistical_filter.k_neighbors
+    sor_ns     = cfg.statistical_filter.n_sigma
 
     # Fit circle center per slice
     centers_3d = Matrix{Float64}(undef, n_slices, 3)
@@ -899,12 +899,12 @@ function _method_spline_2d(rho::Vector{Float64}, phi::Vector{Float64},
     fill!(results, (cross_area=0.0, circumference=0.0, completeness=0.0))
 
     rho_median_global = isempty(rho) ? 0.01 : median(rho)
-    surface_res = cfg.qsm_surface_res_scalar * cfg.pipeline_subsample_res
+    surface_res = cfg.qsm.surface_res_scalar * cfg.pipeline.subsample_res
     phi_bin_num = clamp(ceil(Int, 2π * rho_median_global / surface_res),
-                        cfg.qsm_phi_bin_min, cfg.qsm_phi_bin_max)
+                        cfg.qsm.phi_bin_min, cfg.qsm.phi_bin_max)
     dphi = 2π / phi_bin_num
 
-    # Build 2D surface (rho already pre-filtered upstream via cfg.qsm_rho_percentile)
+    # Build 2D surface (rho already pre-filtered upstream via cfg.qsm.rho_percentile)
     surface = _build_rho_surface(rho, phi, pt_slice_ids, n_slices, phi_bin_num)
 
     # Compute completeness per slice before gap-filling
@@ -916,7 +916,7 @@ function _method_spline_2d(rho::Vector{Float64}, phi::Vector{Float64},
 
     # Fill gaps and smooth
     _fill_gaps_2d!(surface)
-    _smooth_surface_2d!(surface, 0.5, cfg.qsm_spl_z_smoothing)
+    _smooth_surface_2d!(surface, 0.5, cfg.qsm.spl_z_smoothing)
 
     # Extract per-slice metrics
     @inbounds for s in 1:n_slices
@@ -947,7 +947,7 @@ end
 Bin all NBS points into a 2D grid of rho values; each cell is the arithmetic
 mean of all rho values falling into it, empty cells are NaN. Rho-outlier
 filtering happens upstream in `_filter_rho_outliers` (driven by
-`cfg.qsm_rho_percentile`), so this routine has no percentile knob of its own.
+`cfg.qsm.rho_percentile`), so this routine has no percentile knob of its own.
 """
 function _build_rho_surface(rho::Vector{Float64}, phi::Vector{Float64},
                             pt_slice_ids::Vector{Int}, n_slices::Int,
@@ -1268,7 +1268,7 @@ function _build_tree_table(nodes::Vector{QSMNode},
     tree_ids_per_node = Int32[nd.tree_id for nd in nodes]
     tree_groups = group_indices_by_label(1:length(nodes), tree_ids_per_node)
     n_trees = length(tree_groups)
-    bh = cfg.qsm_breast_height
+    bh = cfg.qsm.breast_height
 
     tree_headers = [
         "tree_id",

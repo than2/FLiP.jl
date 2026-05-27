@@ -157,33 +157,33 @@ end
     cfg = deepcopy(FLiP._CFG)
 
     # Both off → identity
-    cfg.pipeline_enable_subsample = false
-    cfg.preprocess_enable_statistical_filter = false
+    cfg.pipeline.enable_subsample = false
+    cfg.preprocess.enable_statistical_filter = false
     c, a = FLiP._apply_preprocess_filters(coords, attrs; cfg=cfg)
     @test size(c) == size(coords)
     @test length(a[:intensity]) == 500
 
     # Subsample only
-    cfg.pipeline_enable_subsample = true
-    cfg.preprocess_enable_statistical_filter = false
-    cfg.pipeline_subsample_res = 0.5
+    cfg.pipeline.enable_subsample = true
+    cfg.preprocess.enable_statistical_filter = false
+    cfg.pipeline.subsample_res = 0.5
     c1, a1 = FLiP._apply_preprocess_filters(coords, attrs; cfg=cfg)
     @test size(c1, 1) <= 500
     @test length(a1[:intensity]) == size(c1, 1)
 
     # Stat-filter only (the previously-broken E57 case)
-    cfg.pipeline_enable_subsample = false
-    cfg.preprocess_enable_statistical_filter = true
-    cfg.statistical_filter_k_neighbors = 10
-    cfg.statistical_filter_n_sigma = 2.0
+    cfg.pipeline.enable_subsample = false
+    cfg.preprocess.enable_statistical_filter = true
+    cfg.statistical_filter.k_neighbors = 10
+    cfg.statistical_filter.n_sigma = 2.0
     c2, a2 = FLiP._apply_preprocess_filters(coords, attrs; cfg=cfg)
     @test size(c2, 1) < 500            # outliers removed
     @test size(c2, 1) >= 490           # most clean points kept
     @test length(a2[:intensity]) == size(c2, 1)
 
     # Both on
-    cfg.pipeline_enable_subsample = true
-    cfg.preprocess_enable_statistical_filter = true
+    cfg.pipeline.enable_subsample = true
+    cfg.preprocess.enable_statistical_filter = true
     c3, a3 = FLiP._apply_preprocess_filters(coords, attrs; cfg=cfg)
     @test size(c3, 1) <= size(c1, 1)
     @test length(a3[:intensity]) == size(c3, 1)

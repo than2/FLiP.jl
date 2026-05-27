@@ -35,22 +35,22 @@ validate required pipeline fields, and create the output directory. Mutates
 function _stage_initialization(config_path::AbstractString)
     cfg = load_config!(String(config_path))
 
-    cfg.pipeline_input_path    = expanduser(strip(cfg.pipeline_input_path))
-    cfg.pipeline_output_dir    = expanduser(strip(cfg.pipeline_output_dir))
-    cfg.pipeline_output_prefix = strip(cfg.pipeline_output_prefix)
+    cfg.pipeline.input_path    = expanduser(strip(cfg.pipeline.input_path))
+    cfg.pipeline.output_dir    = expanduser(strip(cfg.pipeline.output_dir))
+    cfg.pipeline.output_prefix = strip(cfg.pipeline.output_prefix)
 
-    isempty(cfg.pipeline_input_path)    && throw(ArgumentError("pipeline.input_path must be set in config"))
-    isempty(cfg.pipeline_output_dir)    && throw(ArgumentError("pipeline.output_dir must be set in config"))
-    isempty(cfg.pipeline_output_prefix) && throw(ArgumentError("pipeline.output_prefix must be set in config"))
-    (isfile(cfg.pipeline_input_path) || isdir(cfg.pipeline_input_path)) ||
-        throw(ArgumentError("pipeline input path not found: $(cfg.pipeline_input_path)"))
+    isempty(cfg.pipeline.input_path)    && throw(ArgumentError("pipeline.input_path must be set in config"))
+    isempty(cfg.pipeline.output_dir)    && throw(ArgumentError("pipeline.output_dir must be set in config"))
+    isempty(cfg.pipeline.output_prefix) && throw(ArgumentError("pipeline.output_prefix must be set in config"))
+    (isfile(cfg.pipeline.input_path) || isdir(cfg.pipeline.input_path)) ||
+        throw(ArgumentError("pipeline input path not found: $(cfg.pipeline.input_path)"))
 
-    cfg.pipeline_subsample_res > 0 || throw(ArgumentError("pipeline.subsample_res must be > 0"))
-    cfg.pipeline_xy_resolution > 0 || throw(ArgumentError("pipeline.xy_resolution must be > 0"))
-    cfg.pipeline_idw_k >= 1        || throw(ArgumentError("pipeline.idw_k must be >= 1"))
-    cfg.pipeline_idw_power > 0     || throw(ArgumentError("pipeline.idw_power must be > 0"))
+    cfg.pipeline.subsample_res > 0 || throw(ArgumentError("pipeline.subsample_res must be > 0"))
+    cfg.pipeline.xy_resolution > 0 || throw(ArgumentError("pipeline.xy_resolution must be > 0"))
+    cfg.pipeline.idw_k >= 1        || throw(ArgumentError("pipeline.idw_k must be >= 1"))
+    cfg.pipeline.idw_power > 0     || throw(ArgumentError("pipeline.idw_power must be > 0"))
 
-    mkpath(cfg.pipeline_output_dir)
+    mkpath(cfg.pipeline.output_dir)
     return cfg
 end
 
@@ -65,9 +65,9 @@ written::Bool)`: the merged cloud (or `nothing` if disabled), the canonical
 single-file output path, and whether the stage produced output.
 """
 function _stage_preprocess(cfg::FLiPConfig)
-    fmt  = lowercase(cfg.pipeline_output_format)
-    path = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "preprocess", fmt)
-    if cfg.pipeline_enable_preprocess
+    fmt  = lowercase(cfg.pipeline.output_format)
+    path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "preprocess", fmt)
+    if cfg.pipeline.enable_preprocess
         return (cloud=preprocess(; cfg=cfg), path=path, written=true)
     end
     @info "[main] preprocess disabled by config"
@@ -86,11 +86,11 @@ Returns `(ground, agh, ground_path, agh_path, ground_written, agh_written,
 n_preprocess, n_ground)`.
 """
 function _stage_ground(cfg::FLiPConfig, pc_preprocess)
-    fmt = lowercase(cfg.pipeline_output_format)
-    ground_path = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "ground", fmt)
-    agh_path    = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "agh",    fmt)
+    fmt = lowercase(cfg.pipeline.output_format)
+    ground_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "ground", fmt)
+    agh_path    = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "agh",    fmt)
 
-    if !cfg.pipeline_enable_ground_segmentation
+    if !cfg.pipeline.enable_ground_segmentation
         @info "[main] ground segmentation disabled by config"
         return (ground=nothing, agh=nothing,
                 ground_path=ground_path, agh_path=agh_path,
@@ -104,7 +104,7 @@ function _stage_ground(cfg::FLiPConfig, pc_preprocess)
 
     write_pc(ground_path, res.ground_points); @info "[main] wrote: $ground_path"
     agh_written = false
-    if cfg.pipeline_enable_agh
+    if cfg.pipeline.enable_agh
         write_pc(agh_path, res.agh_cloud); @info "[main] wrote: $agh_path"
         agh_written = true
     end
@@ -127,11 +127,11 @@ Returns `(result, tree_path, skeleton_path, tree_written, skeleton_written,
 n_components)`. `result` is `nothing` when the stage is disabled.
 """
 function _stage_tree(cfg::FLiPConfig, pc_agh)
-    fmt = lowercase(cfg.pipeline_output_format)
-    tree_path     = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "tree",     fmt)
-    skeleton_path = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "skeleton", fmt)
+    fmt = lowercase(cfg.pipeline.output_format)
+    tree_path     = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "tree",     fmt)
+    skeleton_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "skeleton", fmt)
 
-    if !cfg.pipeline_enable_tree_segmentation
+    if !cfg.pipeline.enable_tree_segmentation
         @info "[main] tree segmentation disabled by config"
         return (result=nothing,
                 tree_path=tree_path, skeleton_path=skeleton_path,
@@ -161,14 +161,14 @@ Run the QSM stage (or `(status=:skipped,)` if disabled). If `tree_res` is
 via `_load_tree_result`.
 """
 function _stage_qsm(cfg::FLiPConfig, tree_res, config_path::AbstractString)
-    cfg.pipeline_enable_qsm || return (status=:skipped,)
+    cfg.pipeline.enable_qsm || return (status=:skipped,)
     tr = isnothing(tree_res) ? _load_tree_result(cfg) : tree_res
-    fmt = lowercase(cfg.pipeline_output_format)
-    tree_path = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "tree", fmt)
+    fmt = lowercase(cfg.pipeline.output_format)
+    tree_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "tree", fmt)
     return qsm(tree_result=tr,
                config_path=String(config_path),
-               output_dir=cfg.pipeline_output_dir,
-               output_prefix=cfg.pipeline_output_prefix,
+               output_dir=cfg.pipeline.output_dir,
+               output_prefix=cfg.pipeline.output_prefix,
                tree_cloud_path=tree_path)
 end
 
@@ -180,13 +180,13 @@ Run the report stage (or `(status=:skipped,)` if disabled). If `tree_res` is
 from disk via `_load_tree_result`.
 """
 function _stage_report(cfg::FLiPConfig, tree_res, qsm_res, config_path::AbstractString)
-    cfg.pipeline_enable_generate_report || return (status=:skipped,)
+    cfg.pipeline.enable_generate_report || return (status=:skipped,)
     tr = isnothing(tree_res) ? _load_tree_result(cfg) : tree_res
     return generate_report(tree_result=tr,
                            qsm_result=qsm_res,
                            config_path=String(config_path),
-                           output_dir=cfg.pipeline_output_dir,
-                           output_prefix=cfg.pipeline_output_prefix)
+                           output_dir=cfg.pipeline.output_dir,
+                           output_prefix=cfg.pipeline.output_prefix)
 end
 
 # ── Resume helpers (used by the stage functions) ──────────────────
@@ -203,16 +203,16 @@ function _prepare_stage_input(data, cfg::FLiPConfig, stem::AbstractString,
                               label::AbstractString, consumer::AbstractString)
     isnothing(data) || return data
 
-    fmt = lowercase(cfg.pipeline_output_format)
-    single = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, stem, fmt)
+    fmt = lowercase(cfg.pipeline.output_format)
+    single = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, stem, fmt)
     if isfile(single)
         @info "[main] resume: loading $single"
         return read_pc(single)
     end
 
-    scans = find_scan_outputs(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, stem, fmt)
+    scans = find_scan_outputs(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, stem, fmt)
     if !isempty(scans)
-        @info "[main] resume: loading $(length(scans)) $stem files from $(cfg.pipeline_output_dir)"
+        @info "[main] resume: loading $(length(scans)) $stem files from $(cfg.pipeline.output_dir)"
         T = coord_type(cfg)
         all_coords = Vector{Matrix{T}}(undef, length(scans))
         all_attrs  = Vector{Dict{Symbol,Vector}}(undef, length(scans))
@@ -228,7 +228,7 @@ function _prepare_stage_input(data, cfg::FLiPConfig, stem::AbstractString,
     end
 
     throw(ArgumentError(
-        "$consumer requires $label in memory, at $single, or as $(cfg.pipeline_output_prefix)$(stem)_S{i}.$fmt scans; no data available"))
+        "$consumer requires $label in memory, at $single, or as $(cfg.pipeline.output_prefix)$(stem)_S{i}.$fmt scans; no data available"))
 end
 
 """
@@ -242,8 +242,8 @@ with empty / zero defaults. Throws if the tree output is not on disk.
 function _load_tree_result(cfg::FLiPConfig)
     pc_tree = _prepare_stage_input(nothing, cfg, "tree",
                                    "tree output", "qsm/report stage")
-    fmt = lowercase(cfg.pipeline_output_format)
-    skeleton_path = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "skeleton", fmt)
+    fmt = lowercase(cfg.pipeline.output_format)
+    skeleton_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "skeleton", fmt)
     pc_skeleton = isfile(skeleton_path) ? read_pc(skeleton_path) : pc_tree[1:0]
     return (
         pc_output=pc_tree,
@@ -275,9 +275,9 @@ outputs are forwarded as-is.
 function _summarize(cfg::FLiPConfig, pp_output, g_output, t_output, q_output, r_output)
     return (
         config = (
-            input_path    = cfg.pipeline_input_path,
-            output_dir    = cfg.pipeline_output_dir,
-            output_prefix = cfg.pipeline_output_prefix,
+            input_path    = cfg.pipeline.input_path,
+            output_dir    = cfg.pipeline.output_dir,
+            output_prefix = cfg.pipeline.output_prefix,
         ),
         preprocess = (path=pp_output.path,
                       written=pp_output.written,

@@ -110,8 +110,8 @@ considered outliers.
 - `Vector{Int}`: Indices of inlier points
 """
 function statistical_filter(points::AbstractMatrix{<:Real},
-                            k_neighbors::Int=_CFG.statistical_filter_k_neighbors,
-                            n_sigma::Real=_CFG.statistical_filter_n_sigma)
+                            k_neighbors::Int=_CFG.statistical_filter.k_neighbors,
+                            n_sigma::Real=_CFG.statistical_filter.n_sigma)
     size(points, 2) == 3 || throw(ArgumentError("points must be N×3 matrix"))
     k_neighbors > 0 || throw(ArgumentError("k_neighbors must be > 0"))
     n_sigma > 0 || throw(ArgumentError("n_sigma must be > 0"))

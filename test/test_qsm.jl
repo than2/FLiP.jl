@@ -63,8 +63,8 @@
 
         # Use default config but make output_dir a tempdir
         cfg = FLiP._CFG
-        old_subsample = cfg.pipeline_subsample_res
-        cfg.pipeline_subsample_res = 0.05
+        old_subsample = cfg.pipeline.subsample_res
+        cfg.pipeline.subsample_res = 0.05
 
         result = FLiP.qsm(
             tree_result=tree_result,
@@ -73,7 +73,7 @@
             output_prefix="test",
         )
 
-        cfg.pipeline_subsample_res = old_subsample
+        cfg.pipeline.subsample_res = old_subsample
 
         @test result.status == :success || result.status == :no_linear_nbs
         if result.status == :success
@@ -333,11 +333,11 @@
         nbs_ids = ones(Int32, n_pts)
 
         cfg_off = deepcopy(FLiP._CFG)
-        cfg_off.pipeline_subsample_res     = 0.05
-        cfg_off.qsm_completeness_threshold = 0.1
-        cfg_off.qsm_qc_enable              = false
+        cfg_off.pipeline.subsample_res     = 0.05
+        cfg_off.qsm.completeness_threshold = 0.1
+        cfg_off.qsm.qc_enable              = false
         cfg_on = deepcopy(cfg_off)
-        cfg_on.qsm_qc_enable               = true
+        cfg_on.qsm.qc_enable               = true
         # CC link radius = QC_CC_RADIUS_SCALAR (=2.0) × subsample_res = 0.10 m < cluster gap 0.20 m
 
         linear_off = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_off)
@@ -387,11 +387,11 @@
         nbs_ids = ones(Int32, n_pts)
 
         cfg_off = deepcopy(FLiP._CFG)
-        cfg_off.pipeline_subsample_res     = 0.05
-        cfg_off.qsm_completeness_threshold = 0.1
-        cfg_off.qsm_qc_enable              = false
+        cfg_off.pipeline.subsample_res     = 0.05
+        cfg_off.qsm.completeness_threshold = 0.1
+        cfg_off.qsm.qc_enable              = false
         cfg_on = deepcopy(cfg_off)
-        cfg_on.qsm_qc_enable               = true
+        cfg_on.qsm.qc_enable               = true
 
         linear_off = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_off)
         linear_on  = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_on)
@@ -434,11 +434,11 @@
         nbs_ids = ones(Int32, n_pts)
 
         cfg_off = deepcopy(FLiP._CFG)
-        cfg_off.pipeline_subsample_res     = 0.05
-        cfg_off.qsm_completeness_threshold = 0.1
-        cfg_off.qsm_qc_enable              = false
+        cfg_off.pipeline.subsample_res     = 0.05
+        cfg_off.qsm.completeness_threshold = 0.1
+        cfg_off.qsm.qc_enable              = false
         cfg_on = deepcopy(cfg_off)
-        cfg_on.qsm_qc_enable               = true
+        cfg_on.qsm.qc_enable               = true
 
         linear_off = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_off)
         linear_on  = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_on)

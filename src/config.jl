@@ -1,150 +1,193 @@
 """
 Package-wide configuration for FLiP.jl.
 
-Default parameter values are loaded from `flip_config.toml` in the package root at
-module initialization. Call `load_config!` to reload from a different file at runtime.
+`FLiPConfig` is a wrapper struct whose fields mirror the section structure of
+`flip_config.toml`. Access is hierarchical (e.g. `cfg.qsm.min_node_size`,
+`cfg.pipeline.subsample_res`) and matches the TOML 1:1 — every field lives in
+the section that owns its TOML key.
+
+Default values are loaded from `flip_config.toml` in the package root at module
+initialization. Call `load_config!` to reload from a different file at runtime.
 """
 
 using TOML
 
+# ── Section structs ──────────────────────────────────────────────────────────
+# One mutable struct per TOML `[section]`. Field names match TOML keys exactly.
+
+mutable struct StatisticalFilterCfg
+    k_neighbors::Int
+    n_sigma::Float64
+end
+StatisticalFilterCfg(d::Dict) = StatisticalFilterCfg(
+    Int(get(d, "k_neighbors", 6)),
+    Float64(get(d, "n_sigma",  1.0)),
+)
+
+mutable struct SegmentGroundCfg
+    voxel_size::Float64
+    min_cc_size::Int
+    grid_size::Float64
+    cone_theta_deg::Float64
+    polygon_buffer::Float64
+    enable_ground_crop::Bool
+end
+SegmentGroundCfg(d::Dict) = SegmentGroundCfg(
+    Float64(get(d, "voxel_size",         0.5)),
+    Int(    get(d, "min_cc_size",        50)),
+    Float64(get(d, "grid_size",          0.5)),
+    Float64(get(d, "cone_theta_deg",     60.0)),
+    Float64(get(d, "polygon_buffer",     5.0)),
+    Bool(   get(d, "enable_ground_crop", true)),
+)
+
+mutable struct PreprocessCfg
+    enable_statistical_filter::Bool
+end
+PreprocessCfg(d::Dict) = PreprocessCfg(
+    Bool(get(d, "enable_statistical_filter", false)),
+)
+
+mutable struct TreeSegmentationCfg
+    nearground_agh_threshold::Float64
+    neighbor_radius::Float64
+    frontier_min_cc_size::Int
+    nbs_neighbor_distance::Int
+    min_nbs_size::Int
+    linearity_angle_deg::Float64
+    assembly_merge_threshold::Float64
+    assembly_occlusion_tolerance::Float64
+    resolve_isolated_branches::Bool
+end
+TreeSegmentationCfg(d::Dict) = TreeSegmentationCfg(
+    Float64(get(d, "nearground_agh_threshold",     0.3)),
+    Float64(get(d, "neighbor_radius",              -1.0)),
+    Int(    get(d, "frontier_min_cc_size",         3)),
+    Int(    get(d, "nbs_neighbor_distance",        2)),
+    Int(    get(d, "min_nbs_size",                 5)),
+    Float64(get(d, "linearity_angle_deg",          80.0)),
+    Float64(get(d, "assembly_merge_threshold",     0.5)),
+    Float64(get(d, "assembly_occlusion_tolerance", 0.1)),
+    Bool(   get(d, "resolve_isolated_branches",    false)),
+)
+
+mutable struct QSMCfg
+    nbs_linearity_threshold::Float64
+    slice_height_scalar::Float64
+    min_node_size::Int
+    phi_bin_min::Int
+    phi_bin_max::Int
+    surface_res_scalar::Float64
+    completeness_threshold::Float64
+    breast_height::Float64
+    spl_z_smoothing::Float64
+    rho_percentile::Float64
+    min_octant_taubin::Int
+    qc_enable::Bool
+    qc_continuity_ratio::Float64
+end
+QSMCfg(d::Dict) = QSMCfg(
+    Float64(get(d, "nbs_linearity_threshold", 0.5)),
+    Float64(get(d, "slice_height_scalar",     3.0)),
+    Int(    get(d, "min_node_size",           5)),
+    Int(    get(d, "phi_bin_min",             36)),
+    Int(    get(d, "phi_bin_max",             360)),
+    Float64(get(d, "surface_res_scalar",      0.5)),
+    Float64(get(d, "completeness_threshold",  0.25)),
+    Float64(get(d, "breast_height",           1.3)),
+    Float64(get(d, "spl_z_smoothing",         0.3)),
+    Float64(get(d, "rho_percentile",          1.0)),
+    Int(    get(d, "min_octant_taubin",       3)),
+    Bool(   get(d, "qc_enable",               true)),
+    Float64(get(d, "qc_continuity_ratio",     0.7)),
+)
+
+mutable struct PipelineCfg
+    # I/O
+    input_path::String
+    input_prefix::String
+    input_format::String
+    output_dir::String
+    output_prefix::String
+    output_format::String
+    coordinate_precision::DataType
+
+    # Data parameters
+    subsample_res::Float64
+    xy_resolution::Float64
+    idw_k::Int
+    idw_power::Float64
+
+    # Stage toggles
+    enable_subsample::Bool
+    enable_preprocess::Bool
+    enable_ground_segmentation::Bool
+    enable_agh::Bool
+    enable_tree_segmentation::Bool
+    enable_qsm::Bool
+    enable_generate_report::Bool
+end
+PipelineCfg(d::Dict) = PipelineCfg(
+    String(get(d, "input_path",    "")),
+    String(get(d, "input_prefix",  "")),
+    String(get(d, "input_format",  "las")),
+    String(get(d, "output_dir",    "")),
+    String(get(d, "output_prefix", "output")),
+    String(get(d, "output_format", "las")),
+    let prec_str = lowercase(get(d, "coordinate_precision", "Float32"))
+        prec_str == "float64" ? Float64 : Float32
+    end,
+    Float64(get(d, "subsample_res", 0.05)),
+    Float64(get(d, "xy_resolution", 0.05)),
+    Int(    get(d, "idw_k",         8)),
+    Float64(get(d, "idw_power",     2.0)),
+    Bool(get(d, "enable_subsample",           false)),
+    Bool(get(d, "enable_preprocess",          true)),
+    Bool(get(d, "enable_ground_segmentation", true)),
+    Bool(get(d, "enable_agh",                 true)),
+    Bool(get(d, "enable_tree_segmentation",   true)),
+    Bool(get(d, "enable_qsm",                 true)),
+    Bool(get(d, "enable_generate_report",     true)),
+)
+
+# ── Top-level wrapper ────────────────────────────────────────────────────────
+
 """
     FLiPConfig
 
-Mutable struct holding package-wide default parameters for all filtering functions.
-Modify fields directly or reload from a TOML file with `load_config!`.
+Package-wide configuration. Field layout mirrors `flip_config.toml`:
+
+```
+cfg.pipeline.subsample_res
+cfg.preprocess.enable_statistical_filter
+cfg.statistical_filter.k_neighbors
+cfg.segment_ground.voxel_size
+cfg.tree_segmentation.min_nbs_size
+cfg.qsm.min_node_size
+```
+
+Mutate sub-struct fields directly or reload from a TOML file with
+`load_config!`.
 """
 mutable struct FLiPConfig
-    # statistical_filter
-    statistical_filter_k_neighbors::Int
-    statistical_filter_n_sigma::Float64
-
-    # segment_ground
-    segment_ground_voxel_size::Float64
-    segment_ground_min_cc_size::Int
-    segment_ground_grid_size::Float64
-    segment_ground_cone_theta_deg::Float64
-    ground_polygon_buffer::Float64
-    pipeline_enable_ground_crop::Bool
-
-    # preprocess
-    preprocess_enable_statistical_filter::Bool
-
-    # tree segmentation
-    tree_nearground_agh_threshold::Float64
-    tree_neighbor_radius::Float64
-    tree_frontier_min_cc_size::Int
-    tree_nbs_neighbor_distance::Int
-    tree_min_nbs_size::Int
-    tree_linearity_angle_deg::Float64
-    tree_assembly_merge_threshold::Float64
-    tree_assembly_occlusion_tolerance::Float64
-    tree_resolve_isolated_branches::Bool
-
-    # qsm
-    qsm_nbs_linearity_threshold::Float64
-    qsm_slice_height_scalar::Float64
-    qsm_min_node_size::Int
-    qsm_phi_bin_min::Int
-    qsm_phi_bin_max::Int
-    qsm_surface_res_scalar::Float64
-    qsm_completeness_threshold::Float64
-    qsm_breast_height::Float64
-    qsm_spl_z_smoothing::Float64
-    qsm_rho_percentile::Float64
-    qsm_min_octant_taubin::Int
-    qsm_qc_enable::Bool
-    qsm_qc_continuity_ratio::Float64
-
-    # coordinate precision
-    coordinate_precision::DataType
-
-    # pipeline runner
-    pipeline_input_path::String
-    pipeline_input_prefix::String
-    pipeline_input_format::String
-    pipeline_output_dir::String
-    pipeline_output_prefix::String
-    pipeline_output_format::String
-    pipeline_subsample_res::Float64
-    pipeline_enable_subsample::Bool
-    pipeline_enable_preprocess::Bool
-    pipeline_enable_agh::Bool
-    pipeline_xy_resolution::Float64
-    pipeline_idw_k::Int
-    pipeline_idw_power::Float64
-    pipeline_enable_ground_segmentation::Bool
-    pipeline_enable_tree_segmentation::Bool
-    pipeline_enable_qsm::Bool
-    pipeline_enable_generate_report::Bool
+    pipeline::PipelineCfg
+    preprocess::PreprocessCfg
+    statistical_filter::StatisticalFilterCfg
+    segment_ground::SegmentGroundCfg
+    tree_segmentation::TreeSegmentationCfg
+    qsm::QSMCfg
 end
 
-function FLiPConfig(d::Dict)
-    sf = get(d, "statistical_filter",               Dict{String,Any}())
-    sg = get(d, "segment_ground",                   Dict{String,Any}())
-    pp = get(d, "preprocess",                       Dict{String,Any}())
-    ts = get(d, "tree_segmentation",                Dict{String,Any}())
-    qm = get(d, "qsm",                             Dict{String,Any}())
-    pl = get(d, "pipeline",                         Dict{String,Any}())
+FLiPConfig(d::Dict) = FLiPConfig(
+    PipelineCfg(         get(d, "pipeline",           Dict{String,Any}())),
+    PreprocessCfg(       get(d, "preprocess",         Dict{String,Any}())),
+    StatisticalFilterCfg(get(d, "statistical_filter", Dict{String,Any}())),
+    SegmentGroundCfg(    get(d, "segment_ground",     Dict{String,Any}())),
+    TreeSegmentationCfg( get(d, "tree_segmentation",  Dict{String,Any}())),
+    QSMCfg(              get(d, "qsm",                Dict{String,Any}())),
+)
 
-    FLiPConfig(
-        Int(get(sf, "k_neighbors",         6)),
-        Float64(get(sf, "n_sigma",         1.0)),
-        Float64(get(sg, "voxel_size",      0.5)),
-        Int(get(sg, "min_cc_size",         50)),
-        Float64(get(sg, "grid_size",       0.5)),
-        Float64(get(sg, "cone_theta_deg",  60.0)),
-        Float64(get(sg, "polygon_buffer",  5.0)),
-        Bool(get(sg, "enable_ground_crop", true)),
-
-        Bool(get(pp, "enable_statistical_filter", false)),
-
-        Float64(get(ts, "nearground_agh_threshold", 0.3)),
-        Float64(get(ts, "neighbor_radius", -1.0)),
-        Int(get(ts, "frontier_min_cc_size", 3)),
-        Int(get(ts, "nbs_neighbor_distance", 2)),
-        Int(get(ts, "min_nbs_size", 5)),
-        Float64(get(ts, "linearity_angle_deg", 80.0)),
-        Float64(get(ts, "assembly_merge_threshold", 0.5)),
-        Float64(get(ts, "assembly_occlusion_tolerance", 0.1)),
-        Bool(get(ts, "resolve_isolated_branches", false)),
-
-        Float64(get(qm, "nbs_linearity_threshold", 0.5)),
-        Float64(get(qm, "slice_height_scalar", 3.0)),
-        Int(get(qm, "min_node_size", 5)),
-        Int(get(qm, "phi_bin_min", 36)),
-        Int(get(qm, "phi_bin_max", 360)),
-        Float64(get(qm, "surface_res_scalar", 0.5)),
-        Float64(get(qm, "completeness_threshold", 0.25)),
-        Float64(get(qm, "breast_height", 1.3)),
-        Float64(get(qm, "spl_z_smoothing", 0.3)),
-        Float64(get(qm, "rho_percentile", 1.0)),
-        Int(get(qm, "min_octant_taubin", 3)),
-        Bool(get(qm, "qc_enable", true)),
-        Float64(get(qm, "qc_continuity_ratio", 0.7)),
-
-        let prec_str = lowercase(get(pl, "coordinate_precision", "Float32"))
-            prec_str == "float64" ? Float64 : Float32
-        end,
-
-        String(get(pl, "input_path", "")),
-        String(get(pl, "input_prefix", "")),
-        String(get(pl, "input_format", "las")),
-        String(get(pl, "output_dir", "")),
-        String(get(pl, "output_prefix", "output")),
-        String(get(pl, "output_format", "las")),
-        Float64(get(pl, "subsample_res", 0.05)),
-        Bool(get(pl, "enable_subsample", false)),
-        Bool(get(pl, "enable_preprocess", true)),
-        Bool(get(pl, "enable_agh", true)),
-        Float64(get(pl, "xy_resolution", 0.05)),
-        Int(get(pl, "idw_k", 8)),
-        Float64(get(pl, "idw_power", 2.0)),
-        Bool(get(pl, "enable_ground_segmentation", true)),
-        Bool(get(pl, "enable_tree_segmentation", true)),
-        Bool(get(pl, "enable_qsm", true)),
-        Bool(get(pl, "enable_generate_report", true)),
-    )
-end
+# ── Loader + singleton ───────────────────────────────────────────────────────
 
 const _DEFAULT_CONFIG_PATH = joinpath(@__DIR__, "..", "flip_config.toml")
 
@@ -152,8 +195,8 @@ const _DEFAULT_CONFIG_PATH = joinpath(@__DIR__, "..", "flip_config.toml")
     load_config!(path::String) -> FLiPConfig
 
 Load parameter defaults from a TOML configuration file and update the
-package-wide `FLiP._CFG` instance in-place. Missing keys fall back to
-hardcoded defaults.
+package-wide `FLiP._CFG` instance in place by copying each sub-struct's
+fields. Missing keys fall back to hardcoded defaults.
 
 # Arguments
 - `path`: Path to a TOML file (default: `flip_config.toml` in the package root)
@@ -166,8 +209,12 @@ FLiP.load_config!("my_project/flip_config.toml")
 function load_config!(path::String=_DEFAULT_CONFIG_PATH)
     d = isfile(path) ? TOML.parsefile(path) : Dict{String,Any}()
     new_cfg = FLiPConfig(d)
-    for f in fieldnames(FLiPConfig)
-        setfield!(_CFG, f, getfield(new_cfg, f))
+    for section in fieldnames(FLiPConfig)
+        old_sub = getfield(_CFG, section)
+        new_sub = getfield(new_cfg, section)
+        for f in fieldnames(typeof(old_sub))
+            setfield!(old_sub, f, getfield(new_sub, f))
+        end
     end
     return _CFG
 end
@@ -182,4 +229,4 @@ const _CFG = FLiPConfig(
 
 Return the configured coordinate precision type (`Float32` or `Float64`).
 """
-coord_type(cfg::FLiPConfig=_CFG) = cfg.coordinate_precision
+coord_type(cfg::FLiPConfig=_CFG) = cfg.pipeline.coordinate_precision

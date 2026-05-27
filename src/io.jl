@@ -72,9 +72,9 @@ If it points to a directory, returns all files matching
 directory exists but contains no matching files.
 """
 function find_input_files(; cfg::FLiPConfig=_CFG)
-    input_path = cfg.pipeline_input_path
-    prefix = cfg.pipeline_input_prefix
-    fmt = lowercase(cfg.pipeline_input_format)
+    input_path = cfg.pipeline.input_path
+    prefix = cfg.pipeline.input_prefix
+    fmt = lowercase(cfg.pipeline.input_format)
 
     # Single file mode
     if isfile(input_path)

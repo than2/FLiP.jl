@@ -19,9 +19,9 @@ Workflow:
 """
 function preprocess(; cfg::FLiPConfig=_CFG)
     input_files = find_input_files(; cfg=cfg)
-    output_dir = cfg.pipeline_output_dir
-    output_prefix = cfg.pipeline_output_prefix
-    output_fmt = lowercase(cfg.pipeline_output_format)
+    output_dir = cfg.pipeline.output_dir
+    output_prefix = cfg.pipeline.output_prefix
+    output_fmt = lowercase(cfg.pipeline.output_format)
 
     mkpath(output_dir)
 
@@ -33,7 +33,7 @@ function preprocess(; cfg::FLiPConfig=_CFG)
         @info "[preprocess] Reading file $i/$n_files: $fpath"
         ext = lowercase(splitext(fpath)[2])
 
-        if ext == ".e57" && cfg.pipeline_enable_preprocess
+        if ext == ".e57" && cfg.pipeline.enable_preprocess
             # For large E57 files: subsample/filter on raw coords before building
             # PointCloud — avoids peak memory from full-size cloud construction.
             # (Previously only triggered when subsample was also enabled, which
@@ -44,7 +44,7 @@ function preprocess(; cfg::FLiPConfig=_CFG)
             pc = PointCloud(coords, attrs)
         else
             pc = read_pc(fpath)
-            if cfg.pipeline_enable_preprocess
+            if cfg.pipeline.enable_preprocess
                 coords, attrs = _apply_preprocess_filters(coordinates(pc),
                                                           _all_attributes(pc); cfg=cfg)
                 pc = PointCloud(coords, attrs)
@@ -85,15 +85,15 @@ E57 path (raw arrays straight from `_read_e57_to_raw`), so the two branches
 share a single filter implementation.
 """
 function _apply_preprocess_filters(coords::AbstractMatrix, attrs::Dict; cfg::FLiPConfig=_CFG)
-    if cfg.pipeline_enable_subsample
-        keep = distance_subsample(coords, cfg.pipeline_subsample_res)
+    if cfg.pipeline.enable_subsample
+        keep = distance_subsample(coords, cfg.pipeline.subsample_res)
         coords = coords[keep, :]
         attrs = Dict(k => v[keep] for (k, v) in attrs)
     end
-    if cfg.preprocess_enable_statistical_filter
+    if cfg.preprocess.enable_statistical_filter
         keep = statistical_filter(coords,
-                                  cfg.statistical_filter_k_neighbors,
-                                  cfg.statistical_filter_n_sigma)
+                                  cfg.statistical_filter.k_neighbors,
+                                  cfg.statistical_filter.n_sigma)
         coords = coords[keep, :]
         attrs = Dict(k => v[keep] for (k, v) in attrs)
     end

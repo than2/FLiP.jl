@@ -5,10 +5,10 @@ Run the ground-segmentation workflow:
 1. Always: [`segment_ground`](@ref) extracts ground points using the
    voxel connected-component → grid Z-min → upward conic filter chain
    (parameters from `cfg.segment_ground_*`).
-2. If `cfg.pipeline_enable_ground_crop`: [`crop_by_ground_polygon`](@ref)
+2. If `cfg.segment_ground.enable_ground_crop`: [`crop_by_ground_polygon`](@ref)
    clips the working cloud to the buffered convex hull of the ground
    points.
-3. If `cfg.pipeline_enable_agh`: [`calculate_aboveground_height`](@ref)
+3. If `cfg.pipeline.enable_agh`: [`calculate_aboveground_height`](@ref)
    pointwise-IDW interpolates ground z at each query XY and stamps `:AGH`
    onto the (possibly cropped) cloud.
 
@@ -23,32 +23,32 @@ Returns a `NamedTuple` with fields:
 function ground_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     ground_points = segment_ground(
         pc;
-        grid_size=cfg.segment_ground_grid_size,
-        cone_theta_deg=cfg.segment_ground_cone_theta_deg,
-        voxel_size=cfg.segment_ground_voxel_size,
-        min_cc_size=cfg.segment_ground_min_cc_size,
+        grid_size=cfg.segment_ground.grid_size,
+        cone_theta_deg=cfg.segment_ground.cone_theta_deg,
+        voxel_size=cfg.segment_ground.voxel_size,
+        min_cc_size=cfg.segment_ground.min_cc_size,
     )
 
     ground_area = 0.0
     pc_use = pc
 
-    if cfg.pipeline_enable_ground_crop
+    if cfg.segment_ground.enable_ground_crop
         crop_res = crop_by_ground_polygon(pc, ground_points;
-            buffer=cfg.ground_polygon_buffer,
-            k_neighbors=cfg.statistical_filter_k_neighbors,
-            n_sigma=cfg.statistical_filter_n_sigma)
+            buffer=cfg.segment_ground.polygon_buffer,
+            k_neighbors=cfg.statistical_filter.k_neighbors,
+            n_sigma=cfg.statistical_filter.n_sigma)
         pc_use = crop_res.pc_cropped
         ground_area = crop_res.ground_area
         @info "Ground polygon crop: $(npoints(pc)) → $(npoints(pc_use)) points, ground area = $(round(ground_area; digits=2)) m²"
     end
 
-    if cfg.pipeline_enable_agh
+    if cfg.pipeline.enable_agh
         agh = calculate_aboveground_height(
             pc_use,
             ground_points;
-            xy_resolution=cfg.pipeline_xy_resolution,
-            idw_k=cfg.pipeline_idw_k,
-            idw_power=cfg.pipeline_idw_power,
+            xy_resolution=cfg.pipeline.xy_resolution,
+            idw_k=cfg.pipeline.idw_k,
+            idw_power=cfg.pipeline.idw_power,
         )
         # addattribute returns a new PointCloud sharing pc_use.coords — avoids
         # leaking :AGH onto the caller's input cloud when crop is disabled.
@@ -76,10 +76,10 @@ Segment ground points from a point cloud using:
 3. Upward conic filtering
 """
 function segment_ground(pc::PointCloud;
-                        grid_size::Real=_CFG.segment_ground_grid_size,
-                        cone_theta_deg::Real=_CFG.segment_ground_cone_theta_deg,
-                        voxel_size::Real=_CFG.segment_ground_voxel_size,
-                        min_cc_size::Int=_CFG.segment_ground_min_cc_size)
+                        grid_size::Real=_CFG.segment_ground.grid_size,
+                        cone_theta_deg::Real=_CFG.segment_ground.cone_theta_deg,
+                        voxel_size::Real=_CFG.segment_ground.voxel_size,
+                        min_cc_size::Int=_CFG.segment_ground.min_cc_size)
     coords = coordinates(pc)
 
     idx1 = voxel_connected_component_filter(coords, voxel_size, min_cc_size=min_cc_size)
@@ -96,9 +96,9 @@ end
 
 """
     crop_by_ground_polygon(pc::PointCloud, ground_points::PointCloud;
-        buffer::Real=_CFG.ground_polygon_buffer,
-        k_neighbors::Int=_CFG.statistical_filter_k_neighbors,
-        n_sigma::Real=_CFG.statistical_filter_n_sigma) -> (pc_cropped, ground_area)
+        buffer::Real=_CFG.segment_ground.polygon_buffer,
+        k_neighbors::Int=_CFG.statistical_filter.k_neighbors,
+        n_sigma::Real=_CFG.statistical_filter.n_sigma) -> (pc_cropped, ground_area)
 
 Crop a point cloud to the buffered 2D convex hull of ground points.
 
@@ -120,9 +120,9 @@ buffered polygon.
   - `ground_area::Float64`: Area of the buffered polygon in m²
 """
 function crop_by_ground_polygon(pc::PointCloud, ground_points::PointCloud;
-                                buffer::Real=_CFG.ground_polygon_buffer,
-                                k_neighbors::Int=_CFG.statistical_filter_k_neighbors,
-                                n_sigma::Real=_CFG.statistical_filter_n_sigma)
+                                buffer::Real=_CFG.segment_ground.polygon_buffer,
+                                k_neighbors::Int=_CFG.statistical_filter.k_neighbors,
+                                n_sigma::Real=_CFG.statistical_filter.n_sigma)
     # Clean ground points before computing hull
     gnd_clean = ground_points[statistical_filter(coordinates(ground_points), k_neighbors, n_sigma)]
     if npoints(gnd_clean) < 3

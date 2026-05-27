@@ -202,14 +202,14 @@
         agh_no_ground = fill(1.0, 12)
 
         cfg_off = FLiP.FLiPConfig(Dict{String,Any}())
-        cfg_off.tree_resolve_isolated_branches = false
+        cfg_off.tree_segmentation.resolve_isolated_branches = false
         res_off = FLiP.assemble_segments(f.graph, f.coords, f.nbs_id, f.node_id,
                                          agh_no_ground, f.graph_skeleton, f.skel_pc;
                                          cfg=cfg_off)
         @test all(==(Int32(0)), res_off.tree_id)       # nothing assigned without the flag
 
         cfg_on = FLiP.FLiPConfig(Dict{String,Any}())
-        cfg_on.tree_resolve_isolated_branches = true
+        cfg_on.tree_segmentation.resolve_isolated_branches = true
         res_on = FLiP.assemble_segments(f.graph, f.coords, f.nbs_id, f.node_id,
                                         agh_no_ground, f.graph_skeleton, f.skel_pc;
                                         cfg=cfg_on)
@@ -289,7 +289,7 @@
 
         # Rule B: frac=0.5 > 0.0 → orphan merges into existing tree_nbs_id 1.
         cfg_b = FLiP.FLiPConfig(Dict{String,Any}())
-        cfg_b.tree_assembly_merge_threshold = 0.0
+        cfg_b.tree_segmentation.assembly_merge_threshold = 0.0
         s_b = _initial_state()
         FLiP.process_orphan_segments(coords, nbs_id, node_id,
                                      s_b.tree_id, s_b.tree_nbs_id; cfg=cfg_b)
@@ -298,7 +298,7 @@
 
         # Rule A: frac=0.5 ≤ 0.5 → orphan keeps tree 1 but gets a fresh tnid (> 1).
         cfg_a = FLiP.FLiPConfig(Dict{String,Any}())
-        cfg_a.tree_assembly_merge_threshold = 0.5
+        cfg_a.tree_segmentation.assembly_merge_threshold = 0.5
         s_a = _initial_state()
         FLiP.process_orphan_segments(coords, nbs_id, node_id,
                                      s_a.tree_id, s_a.tree_nbs_id; cfg=cfg_a)
@@ -308,7 +308,7 @@
 
         # merge_threshold = 1.0 fully suppresses orphan→tnid merging.
         cfg_strict = FLiP.FLiPConfig(Dict{String,Any}())
-        cfg_strict.tree_assembly_merge_threshold = 1.0
+        cfg_strict.tree_segmentation.assembly_merge_threshold = 1.0
         s_strict = _initial_state()
         FLiP.process_orphan_segments(coords, nbs_id, node_id,
                                      s_strict.tree_id, s_strict.tree_nbs_id; cfg=cfg_strict)
